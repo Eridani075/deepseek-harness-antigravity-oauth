@@ -12,6 +12,16 @@
 > Google 服务条款，也可能导致账号受限或封禁。请自行评估风险，不要使用重要账号。Google 或
 > Antigravity 的协议变更可能随时使插件失效。
 
+## 免责声明
+
+本项目及其作者与 Google、DeepSeek 或 Antigravity 官方没有隶属、授权或赞助关系。
+
+本插件仅供学习和技术研究使用。用户须自行确认其所在地区的法律法规、Google 服务条款以及相关账号政策，并自行承担使用本插件产生的全部风险，包括但不限于账号限制、服务中断、数据丢失或其他损失。
+
+本项目调用的接口属于非公开接口，作者不保证其长期可用性、稳定性或兼容性，也不承诺为因接口变化、账号策略变化或第三方服务故障导致的问题提供修复。
+
+请勿将 OAuth callback URL、authorization code、access token、refresh token 或其他敏感信息提交到 issue、日志、截图或公开仓库。
+
 ## 功能
 
 - Gemini 文本生成、thinking 和 tool calls/results
