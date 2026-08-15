@@ -1,0 +1,272 @@
+import {
+  ANTIGRAVITY_ENDPOINT_FALLBACKS,
+  buildAntigravityHarnessUserAgent,
+  fetchWithAgyCliTransport,
+} from '@cortexkit/antigravity-auth-core'
+import { Context } from '@deepseek-ai/cordis'
+import LlmRuntime, {
+  CallId,
+  ReasoningEffortId,
+  attributionHeaders,
+  createAssistantMessage,
+  createToolResultMessage,
+  createUserMessage,
+  type GenerateOptions,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
+import { describe, expect, it, vi } from 'vitest'
+import * as Plugin from '../src/index.js'
+import {
+  AntigravityAdapter,
+  parseGeminiSse,
+  type AntigravityAdapterDeps,
+} from '../src/adapter.js'
+import type { StoredCredentials } from '../src/auth.js'
+import { startOAuthCallbackServer } from '../src/oauth-callback.js'
+
+const MODEL = 'antigravity-gemini-3.7-flash'
+const stored: StoredCredentials = {
+  version: 1,
+  refresh: 'refresh|project',
+  access: 'access',
+  expires: Date.now() + 60_000,
+}
+
+function events(...chunks: unknown[]): Response {
+  const body = `${chunks.map(chunk => `data: ${JSON.stringify({ response: chunk })}\r\n\r\n`).join('')}data: [DONE]\r\n\r\n`
+  return new Response(body, { headers: { 'content-type': 'text/event-stream' } })
+}
+
+function options(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
+  return {
+    provider: 'antigravity',
+    model: MODEL,
+    messages: [createUserMessage({
+      content: [{ type: 'text', text: 'hello' }],
+      source: { kind: 'user' },
+    })],
+    ...overrides,
+  }
+}
+
+function adapter(
+  transport: typeof fetchWithAgyCliTransport,
+  credentials: NonNullable<AntigravityAdapterDeps['credentials']> = () => Promise.resolve(stored),
+): AntigravityAdapter {
+  return new AntigravityAdapter({
+    transport,
+    credentials,
+    project: auth => Promise.resolve({ auth, effectiveProjectId: 'project' }),
+    save: () => Promise.resolve(),
+  })
+}
+
+async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
+  const chunks: T[] = []
+  for await (const chunk of stream) chunks.push(chunk)
+  return chunks
+}
+
+describe('AntigravityAdapter', () => {
+  it('maps thinking, tool calls, usage and wire attribution', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events(
+      { candidates: [{ content: { parts: [{ thought: true, text: 'plan', thoughtSignature: 'sig-r' }] } }] },
+      {
+        candidates: [{
+          content: { parts: [
+            { thought: true, thoughtSignature: 'sig-tool' },
+            { functionCall: { id: 'call_1', name: 'lookup', args: { query: 'raw' } } },
+          ] },
+          finishReason: 'STOP',
+        }],
+        usageMetadata: {
+          promptTokenCount: 10,
+          cachedContentTokenCount: 3,
+          candidatesTokenCount: 4,
+          thoughtsTokenCount: 2,
+        },
+      },
+    )))
+
+    const chunks = await collect(adapter(transport).stream(options({
+      reasoningEffort: ReasoningEffortId('high'),
+      tools: [{ name: 'lookup', description: 'Look up a value', parameters: { type: 'object' } }],
+    })))
+
+    expect(chunks.map(chunk => chunk.type)).toEqual([
+      'block-start', 'reasoning-delta', 'block-end',
+      'block-start', 'tool-call-delta', 'block-end',
+      'usage', 'finish',
+    ])
+    expect(chunks.find(chunk => chunk.type === 'tool-call-delta')).toMatchObject({
+      id: 'call_1',
+      name: 'lookup',
+      argumentsDelta: '{"query":"raw"}',
+    })
+    expect(chunks.at(-2)).toEqual({
+      type: 'usage',
+      usage: { inputTokens: 7, outputTokens: 6, cacheReadTokens: 3, reasoningTokens: 2 },
+    })
+    expect(chunks.at(-1)).toMatchObject({
+      type: 'finish',
+      reason: { kind: 'tool-calls' },
+      replayState: {
+        blocks: [
+          { type: 'reasoning', thoughtSignature: 'sig-r' },
+          { type: 'tool-call', thoughtSignature: 'sig-tool' },
+        ],
+      },
+    })
+
+    const [url, init, transportOptions] = transport.mock.calls[0]!
+    expect(url).toContain('/v1internal:streamGenerateContent?alt=sse')
+    expect(transportOptions?.idleTimeoutMs).toBe(5 * 60_000)
+    const userAgent = new Headers(init?.headers).get('user-agent')
+    expect(userAgent).toContain(buildAntigravityHarnessUserAgent())
+    expect(userAgent).toContain(attributionHeaders()['user-agent'])
+  })
+
+  it('replays thought signatures and tool results losslessly', async () => {
+    const callId = CallId('call_history')
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
+      candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }],
+    })))
+    const messages = [
+      createAssistantMessage({
+        content: [
+          { type: 'reasoning', text: 'why' },
+          { type: 'tool-call', id: callId, name: 'lookup', arguments: '{"city":"Shanghai"}' },
+        ],
+        source: {
+          provider: 'antigravity',
+          model: MODEL,
+          replayState: {
+            kind: 'dsh-antigravity-oauth',
+            version: 1,
+            provider: 'antigravity',
+            model: MODEL,
+            blocks: [
+              { type: 'reasoning', thoughtSignature: 'sig-r' },
+              { type: 'tool-call', thoughtSignature: 'sig-t' },
+            ],
+          },
+        },
+      }),
+      createToolResultMessage({
+        callId,
+        content: [{ type: 'text', text: 'sunny' }],
+        isError: false,
+      }),
+    ]
+
+    await collect(adapter(transport).stream(options({ messages })))
+    const envelope = JSON.parse(String(transport.mock.calls[0]?.[1]?.body))
+    expect(envelope.request.contents).toEqual([
+      {
+        role: 'model',
+        parts: [
+          { text: 'why', thought: true, thoughtSignature: 'sig-r' },
+          {
+            functionCall: { name: 'lookup', args: { city: 'Shanghai' }, id: 'call_history' },
+            thoughtSignature: 'sig-t',
+          },
+        ],
+      },
+      {
+        role: 'model',
+        parts: [{
+          functionResponse: { name: 'lookup', response: { output: 'sunny' }, id: 'call_history' },
+        }],
+      },
+    ])
+  })
+
+  it('falls back only after 404 and refreshes once after 401', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>()
+      .mockResolvedValueOnce(new Response('missing', { status: 404 }))
+      .mockResolvedValueOnce(new Response('expired', { status: 401 }))
+      .mockResolvedValueOnce(events({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      }))
+    const credentials = vi.fn((force = false) => Promise.resolve({
+      ...stored,
+      access: force ? 'fresh' : 'stale',
+    }))
+
+    await collect(adapter(transport, credentials).stream(options()))
+
+    expect(transport).toHaveBeenCalledTimes(3)
+    expect(transport.mock.calls[0]?.[0]).toContain(ANTIGRAVITY_ENDPOINT_FALLBACKS[0])
+    expect(transport.mock.calls[1]?.[0]).toContain(ANTIGRAVITY_ENDPOINT_FALLBACKS[1])
+    expect(new Headers(transport.mock.calls[2]?.[1]?.headers).get('authorization')).toBe('Bearer fresh')
+    expect(credentials.mock.calls.map(call => call[0])).toEqual([false, true])
+  })
+
+  it('propagates abort to the transport', async () => {
+    const controller = new AbortController()
+    let started!: () => void
+    const transportStarted = new Promise<void>(resolve => { started = resolve })
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>((_url, _init, transportOptions) => {
+      started()
+      return new Promise((_resolve, reject) => {
+        transportOptions?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+    })
+
+    const pending = collect(adapter(transport).stream(options({ signal: controller.signal })))
+    await transportStarted
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+    expect(transport.mock.calls[0]?.[2]?.signal).toBe(controller.signal)
+  })
+
+  it('rejects malformed and empty SSE streams', async () => {
+    const malformed = new Response('data: {not-json}\n\n')
+    await expect(collect(parseGeminiSse(malformed))).rejects.toMatchObject({ code: 'TRANSPORT' })
+
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(new Response('data: [DONE]\n\n')))
+    await expect(collect(adapter(transport).stream(options()))).rejects.toMatchObject({ code: 'TRANSPORT' })
+  })
+
+  it('unregisters its provider when the plugin fiber is disposed', async () => {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    const fiber = await ctx.plugin(Plugin)
+    expect(ctx.llm.listProviders()).toEqual([{ id: 'antigravity', name: 'Google Antigravity' }])
+    expect(ctx.llm.listConfigurableProviders()).toEqual([{
+      provider: 'antigravity',
+      displayName: 'Google Antigravity',
+      settingsNs: 'llm-antigravity-oauth',
+      settingsPath: ['providers', 'antigravity'],
+    }])
+    await expect(ctx.llm.listModels('antigravity')).resolves.toMatchObject([
+      { id: 'antigravity-gemini-3.7-flash', inputModalities: ['text'] },
+      { id: 'antigravity-gemini-3.6-flash', inputModalities: ['text'] },
+      { id: 'antigravity-gemini-3.5-flash', inputModalities: ['text'] },
+      { id: 'antigravity-gemini-3.1-pro', inputModalities: ['text'] },
+    ])
+    await fiber.dispose()
+    expect(ctx.llm.listProviders()).toEqual([])
+    expect(ctx.llm.listConfigurableProviders()).toEqual([])
+  })
+})
+
+describe('OAuth callback server', () => {
+  it('rejects a mismatched state and captures a valid callback', async () => {
+    const listener = await startOAuthCallbackServer('expected-state', { port: 0, timeoutMs: 1_000 })
+    const baseUrl = `http://127.0.0.1:${listener.port}/oauth-callback`
+    try {
+      const mismatch = await fetch(`${baseUrl}?state=wrong-state&code=wrong-code`)
+      expect(mismatch.status).toBe(400)
+
+      const callback = fetch(`${baseUrl}?state=expected-state&code=authorization-code`)
+      await expect(listener.result).resolves.toEqual({
+        code: 'authorization-code',
+        state: 'expected-state',
+      })
+      expect((await callback).status).toBe(200)
+    } finally {
+      await listener.close()
+    }
+  })
+})

@@ -1,0 +1,4 @@
+- insert:
+    - id: llm-antigravity-oauth
+      name: dsh-antigravity-oauth
+
