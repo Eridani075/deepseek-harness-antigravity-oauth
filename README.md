@@ -211,14 +211,25 @@ curl -sS -o /dev/null -w "%{http_code}\n" https://cloudcode-pa.googleapis.com/
 
 ### `User location is not supported for the API use`
 
-这是 Google 对请求出口地区的限制。请使用 Google 支持地区的代理出口。Antigravity core 会读取
-`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`，例如：
+这是 Google 对**请求出口**的地区限制，判断依据是 DSH 宿主机进程的出口 IP，浏览器能打开授权页不代表
+宿主机出口可用，两者可能走不同线路。
 
-```bash
-HTTPS_PROXY=http://127.0.0.1:7890 \
-NO_PROXY=127.0.0.1,localhost \
-dsh web
-```
+关键点是**限制按节点生效，而不是按国家生效**：实测同一台机器上，一个美国机房节点被拒（HTTP 400
+`FAILED_PRECONDITION`），换成另一个节点（日本）后连续请求全部成功。所以遇到这个错误时：
+
+1. 查看宿主机出口并多测几次，确认节点是否在轮换：
+   ```bash
+   curl -sS https://ipinfo.io/json
+   ```
+2. 找到一个能通过的节点后固定它（关闭自动测速/轮换），或者给 DSH 显式指定代理：
+   ```bash
+   HTTPS_PROXY=http://127.0.0.1:7890 \
+   NO_PROXY=127.0.0.1,localhost \
+   dsh web
+   ```
+3. 换节点后如果仍然报同样的错，说明该节点出口被拒绝，继续换；这个错误无法通过重试自动恢复。
+
+插件会在错误信息后附带同样的提示，便于和其他 400 区分。
 
 ### OAuth 或模型请求出现 `fetch failed`
 

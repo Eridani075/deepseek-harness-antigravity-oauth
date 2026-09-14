@@ -149,6 +149,24 @@ describe('AntigravityAdapter', () => {
     expect(userAgent).toContain(attributionHeaders()['user-agent'])
   })
 
+  it('explains a location rejection instead of only echoing it', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(new Response(
+      JSON.stringify({
+        error: {
+          code: 400,
+          message: 'User location is not supported for the API use.',
+          status: 'FAILED_PRECONDITION',
+        },
+      }),
+      { status: 400, headers: { 'content-type': 'application/json' } },
+    )))
+
+    await expect(collect(adapter(transport).stream(options()))).rejects.toMatchObject({
+      code: 'PROVIDER',
+      message: expect.stringContaining('run the DSH host through a proxy node/region it accepts') as unknown as string,
+    })
+  })
+
   it('replays thought signatures and tool results losslessly', async () => {
     const callId = 'call_history' as ToolCallBlock['id']
     const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({

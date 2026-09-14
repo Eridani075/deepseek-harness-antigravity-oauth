@@ -582,6 +582,20 @@ function errorFacts(body: string | undefined): { message?: string; reason?: stri
   }
 }
 
+/**
+ * Google answers a location it will not serve with a bare 400, which reads
+ * like a request bug. The egress is a host-side property — a browser that
+ * reaches the consent page proves nothing — and it is per proxy node, so the
+ * hint names the actual lever.
+ */
+const LOCATION_REJECTED = /user location is not supported/i
+
+function locationHint(detail: string): string {
+  return LOCATION_REJECTED.test(detail)
+    ? ' — the Antigravity API rejected this host\'s egress location; run the DSH host through a proxy node/region it accepts'
+    : ''
+}
+
 function responseError(result: RequestResult, requestId: string): LlmError {
   const { response, errorBody } = result
   const facts = errorFacts(errorBody)
@@ -595,7 +609,7 @@ function responseError(result: RequestResult, requestId: string): LlmError {
   else if (response.status === 429) code = limit === 'QUOTA_EXHAUSTED' ? QUOTA_EXCEEDED_CODE : 'RATE_LIMIT'
   else if (response.status >= 500) code = 'SERVER'
   else if (isContextWindowExceededError(detail)) code = 'CONTEXT_WINDOW_EXCEEDED'
-  return new LlmError(`Antigravity request failed: ${detail}`, code, {
+  return new LlmError(`Antigravity request failed: ${detail}${locationHint(detail)}`, code, {
     status: response.status,
     requestId: ProviderRequestId(requestId),
     ...(retryAfter === undefined ? {} : { providerRetryAfterMs: retryAfter }),
