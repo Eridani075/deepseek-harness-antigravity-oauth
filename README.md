@@ -25,12 +25,18 @@
 ## 功能
 
 - Gemini 文本生成、thinking 和 tool calls/results
+- 图像输入：图片附件以 Gemini `inlineData` 内联发送
 - 流式响应、usage、abort、自动刷新 token 和失败重试
 - Web UI 设置页直接唤起 Google 登录，并自动接收 OAuth callback
 - Models 设置页删除/恢复 provider
 - Antigravity 设置页退出登录并删除本机 OAuth 凭据
 
-当前不支持图像/PDF 输入和多账号轮换；图像模型不会注册到模型选择器。
+模型声明 `text` 和 `image` 输入模态，因此模型选择器和附件通道会把图片正常下发。当前不支持 PDF
+输入和多账号轮换；图像生成模型不会注册到模型选择器。
+
+PDF 之所以不可用，不是 Antigravity 的限制（上游支持 `application/pdf` 的 `inlineData`），而是
+DSH 的附件通道只保存位图：`image/png`、`image/jpeg`、`image/webp`、`image/gif`，没有 PDF
+内容块可以下发。
 
 ## 模型
 
@@ -151,6 +157,12 @@ Settings → Models。
 ### `EADDRINUSE: 127.0.0.1:51121`
 
 退出旧的 `dsh-antigravity-login`，确认 OAuth callback 端口释放后再重试。
+
+### `Antigravity image input requires the host attachment service`
+
+宿主没有提供 durable attachment service，插件无法读取图片字节。确认当前 DSH 版本包含 attachment
+服务（Web profile 默认包含），并检查该图片是否仍在 attachment 存储中。若图片读取失败，错误信息会
+带上底层原因，例如附件已被清理。
 
 ### `User location is not supported for the API use`
 
