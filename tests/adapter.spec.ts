@@ -11,6 +11,7 @@ import LlmRuntime, {
   createAssistantMessage,
   createToolResultMessage,
   createUserMessage,
+  type ContentBlock,
   type GenerateOptions,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
@@ -20,6 +21,7 @@ import {
   AntigravityAdapter,
   parseGeminiSse,
   type AntigravityAdapterDeps,
+  type AttachmentImageStore,
 } from '../src/adapter.js'
 import type { StoredCredentials } from '../src/auth.js'
 import { startOAuthCallbackServer } from '../src/oauth-callback.js'
@@ -52,12 +54,14 @@ function options(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
 function adapter(
   transport: typeof fetchWithAgyCliTransport,
   credentials: NonNullable<AntigravityAdapterDeps['credentials']> = () => Promise.resolve(stored),
+  attachments?: AntigravityAdapterDeps['attachments'],
 ): AntigravityAdapter {
   return new AntigravityAdapter({
     transport,
     credentials,
     project: auth => Promise.resolve({ auth, effectiveProjectId: 'project' }),
     save: () => Promise.resolve(),
+    ...(attachments ? { attachments } : {}),
   })
 }
 
@@ -65,6 +69,18 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   const chunks: T[] = []
   for await (const chunk of stream) chunks.push(chunk)
   return chunks
+}
+
+type ImageRef = Extract<ContentBlock, { type: 'image' }>['attachment']
+
+function imageAttachment(id: string, mediaType: ImageRef['mediaType']): ImageRef {
+  return {
+    attachmentId: id as ImageRef['attachmentId'],
+    mediaType,
+    bytes: 4,
+    width: 1,
+    height: 1,
+  }
 }
 
 describe('AntigravityAdapter', () => {
@@ -228,6 +244,99 @@ describe('AntigravityAdapter', () => {
     await expect(collect(adapter(transport).stream(options()))).rejects.toMatchObject({ code: 'TRANSPORT' })
   })
 
+  it('normalizes frames whose content omits parts or uses a non-Gemini role', async () => {
+    const framed = new Response(
+      'data: {"candidates":[{"content":{"role":"assistant"}}]}\n\n'
+      + 'data: {"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"},"finishReason":"STOP"}]}\n\n',
+    )
+    const chunks = await collect(parseGeminiSse(framed))
+    expect(chunks[0]?.candidates?.[0]?.content).toEqual({ role: 'model', parts: [] })
+    expect(chunks[1]?.candidates?.[0]?.content).toEqual({ role: 'model', parts: [{ text: 'hi' }] })
+  })
+
+  it('sends image attachments as inlineData and reads each attachment once', async () => {
+    const attachment = imageAttachment('attachment-1', 'image/png')
+    const readImage = vi.fn<AttachmentImageStore['readImage']>(
+      ref => Promise.resolve({ ref, data: Uint8Array.from([1, 2, 3, 4]) }),
+    )
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
+      candidates: [{ content: { parts: [{ text: 'seen' }] }, finishReason: 'STOP' }],
+    })))
+    const messages = [createUserMessage({
+      content: [
+        { type: 'text', text: 'what is this' },
+        { type: 'image', attachment },
+        { type: 'image', attachment },
+      ],
+      source: { kind: 'user' },
+    })]
+
+    await collect(adapter(transport, undefined, () => ({ readImage })).stream(options({ messages })))
+
+    const envelope = JSON.parse(String(transport.mock.calls[0]?.[1]?.body))
+    expect(envelope.request.contents).toEqual([{
+      role: 'user',
+      parts: [
+        { text: 'what is this' },
+        { inlineData: { mimeType: 'image/png', data: 'AQIDBA==' } },
+        { inlineData: { mimeType: 'image/png', data: 'AQIDBA==' } },
+      ],
+    }])
+    expect(readImage).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects image content when the host exposes no attachment service', async () => {
+    const attachment = imageAttachment('attachment-2', 'image/jpeg')
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>()
+    const messages = [createUserMessage({
+      content: [{ type: 'image', attachment }],
+      source: { kind: 'user' },
+    })]
+
+    await expect(collect(adapter(transport).stream(options({ messages }))))
+      .rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
+    expect(transport).not.toHaveBeenCalled()
+  })
+
+  it('retries an empty STOP response and gives up after the third attempt', async () => {
+    const empty = { candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }
+    const retrying = vi.fn<typeof fetchWithAgyCliTransport>()
+      .mockResolvedValueOnce(events(empty))
+      .mockResolvedValueOnce(events({
+        candidates: [{ content: { parts: [{ text: 'second try' }] }, finishReason: 'STOP' }],
+      }))
+
+    const chunks = await collect(adapter(retrying).stream(options()))
+    expect(retrying).toHaveBeenCalledTimes(2)
+    expect(chunks).toContainEqual({ type: 'text-delta', index: 0, text: 'second try' })
+
+    const alwaysEmpty = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events(empty)))
+    await expect(collect(adapter(alwaysEmpty).stream(options())))
+      .rejects.toMatchObject({ code: 'EMPTY_RESPONSE' })
+    expect(alwaysEmpty).toHaveBeenCalledTimes(3)
+  })
+
+  it('moves numeric tool-schema constraints into descriptions for gpt-oss models', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
+      candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+    })))
+    const tool = {
+      name: 'lookup',
+      description: 'Look up a value',
+      parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1 } }, required: ['query'] },
+    }
+
+    await collect(adapter(transport).stream(options({ model: 'antigravity-gpt-oss-120b-medium', tools: [tool] })))
+    const gpt = JSON.parse(String(transport.mock.calls[0]?.[1]?.body))
+    expect(gpt.request.tools[0].functionDeclarations[0].parameters.properties.query)
+      .toEqual({ type: 'STRING', description: 'minLength: 1' })
+
+    await collect(adapter(transport).stream(options({ tools: [tool] })))
+    const gemini = JSON.parse(String(transport.mock.calls[1]?.[1]?.body))
+    expect(gemini.request.tools[0].functionDeclarations[0].parameters.properties.query)
+      .toEqual({ type: 'STRING', minLength: 1 })
+  })
+
   it('unregisters its provider when the plugin fiber is disposed', async () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
@@ -240,10 +349,10 @@ describe('AntigravityAdapter', () => {
       settingsPath: ['providers', 'antigravity'],
     }])
     await expect(ctx.llm.listModels('antigravity')).resolves.toMatchObject([
-      { id: 'antigravity-gemini-3.7-flash', inputModalities: ['text'] },
-      { id: 'antigravity-gemini-3.6-flash', inputModalities: ['text'] },
-      { id: 'antigravity-gemini-3.5-flash', inputModalities: ['text'] },
-      { id: 'antigravity-gemini-3.1-pro', inputModalities: ['text'] },
+      { id: 'antigravity-gemini-3.7-flash', inputModalities: ['text', 'image'] },
+      { id: 'antigravity-gemini-3.6-flash', inputModalities: ['text', 'image'] },
+      { id: 'antigravity-gemini-3.5-flash', inputModalities: ['text', 'image'] },
+      { id: 'antigravity-gemini-3.1-pro', inputModalities: ['text', 'image'] },
     ])
     await fiber.dispose()
     expect(ctx.llm.listProviders()).toEqual([])
