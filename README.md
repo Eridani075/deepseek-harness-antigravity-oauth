@@ -40,14 +40,23 @@ DSH 的附件通道只保存位图：`image/png`、`image/jpeg`、`image/webp`�
 
 ## 模型
 
-当前注册的模型 ID：
+登录后插件会调用上游的 `v1internal:fetchAvailableModels` 获取当前账号可用的模型，并与内置列表合并：
 
 ```text
 antigravity-gemini-3.7-flash
 antigravity-gemini-3.6-flash
 antigravity-gemini-3.5-flash
 antigravity-gemini-3.1-pro
+antigravity-<上游新增模型>      例如 antigravity-gemini-3.8-flash
 ```
+
+上游新增 Gemini 文本模型（`*-pro` / `*-flash`）时，模型选择器里会自动出现，**不需要更新插件**：
+
+- 上游模型名去掉 `antigravity-` 前缀后就是请求使用的 model id；`-preview`、`-tiered`、`-low/-medium/-high`
+  等后缀会归一化，tier 通过 reasoning effort 选择，因此不会出现重复条目。
+- 结果缓存 15 分钟；查询失败时回退到内置列表，并在 60 秒内不再重试，避免模型选择器卡在网络上。
+- 未登录或上游不可达时使用内置列表，所以选择器不会为空。
+- 只注册 Gemini `*-pro` / `*-flash` 文本模型；图像生成、Claude、gpt-oss 等上游条目不在本插件范围内。
 
 `*-pro` 支持 `low` 和 `high` reasoning effort；其他模型支持 `low`、`medium` 和 `high`。
 

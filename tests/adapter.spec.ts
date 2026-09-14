@@ -5,6 +5,7 @@ import {
 } from '@cortexkit/antigravity-auth-core'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, {
+  LlmError,
   ReasoningEffortId,
   attributionHeaders,
   createAssistantMessage,
@@ -15,7 +16,7 @@ import LlmRuntime, {
   type StreamChunk,
   type ToolCallBlock,
 } from '@deepseek-ai/dsh-llm'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as Plugin from '../src/index.js'
 import {
   AntigravityAdapter,
@@ -55,15 +56,21 @@ function adapter(
   transport: typeof fetchWithAgyCliTransport,
   credentials: NonNullable<AntigravityAdapterDeps['credentials']> = () => Promise.resolve(stored),
   attachments?: AntigravityAdapterDeps['attachments'],
+  availableModels: NonNullable<AntigravityAdapterDeps['availableModels']> = () => Promise.resolve({ models: {} }),
 ): AntigravityAdapter {
   return new AntigravityAdapter({
     transport,
     credentials,
     project: auth => Promise.resolve({ auth, effectiveProjectId: 'project' }),
     save: () => Promise.resolve(),
+    availableModels,
     ...(attachments ? { attachments } : {}),
   })
 }
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 
 async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   const chunks: T[] = []
@@ -365,6 +372,7 @@ describe('AntigravityAdapter', () => {
   })
 
   it('unregisters its provider when the plugin fiber is disposed', async () => {
+    vi.stubEnv('DSH_ANTIGRAVITY_AUTH_FILE', '/nonexistent/antigravity-oauth.json')
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
     const fiber = await ctx.plugin(Plugin)
@@ -384,6 +392,96 @@ describe('AntigravityAdapter', () => {
     await fiber.dispose()
     expect(ctx.llm.listProviders()).toEqual([])
     expect(ctx.llm.listConfigurableProviders()).toEqual([])
+  })
+})
+
+describe('AntigravityAdapter upstream model discovery', () => {
+  it('merges upstream models the bundled table does not know yet', async () => {
+    const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
+      models: {
+        'gemini-3.7-flash': { displayName: 'Gemini 3.7 Flash' },
+        'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash' },
+        'gemini-3.8-flash-high': {},
+        'gemini-3.9-pro': {},
+        'gemini-3.1-flash-image': { displayName: 'Nano Banana' },
+        'gpt-oss-120b-medium': { displayName: 'GPT-OSS 120B' },
+        'claude-sonnet-4-6-thinking': { displayName: 'Claude Sonnet' },
+      },
+    }))
+    const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
+
+    const models = await instance.listModels('antigravity')
+
+    expect(models.map(model => model.id)).toEqual([
+      'antigravity-gemini-3.7-flash',
+      'antigravity-gemini-3.6-flash',
+      'antigravity-gemini-3.5-flash',
+      'antigravity-gemini-3.1-pro',
+      'antigravity-gemini-3.8-flash',
+      'antigravity-gemini-3.9-pro',
+    ])
+    expect(models.at(-2)).toMatchObject({
+      provider: 'antigravity',
+      name: 'Gemini 3.8 Flash (Antigravity)',
+      inputModalities: ['text', 'image'],
+    })
+    await expect(instance.resolveModel('antigravity', 'antigravity-gemini-3.9-pro')).resolves.toMatchObject({
+      name: 'Gemini 3.9 Pro (Antigravity)',
+      context: { contextWindow: 1_048_576 },
+      reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] },
+    })
+  })
+
+  it('routes a discovered model with its resolved upstream id', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
+      candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+    })))
+    const instance = adapter(transport, undefined, undefined, async () => ({
+      models: { 'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash' } },
+    }))
+
+    await collect(instance.stream(options({
+      model: 'antigravity-gemini-3.8-flash',
+      reasoningEffort: ReasoningEffortId('high'),
+    })))
+
+    const envelope = JSON.parse(String(transport.mock.calls[0]?.[1]?.body))
+    expect(envelope.model).toBe('gemini-3.8-flash-high')
+  })
+
+  it('keeps the bundled catalog when discovery fails', async () => {
+    const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(
+      async () => { throw new Error('fetch failed') },
+    )
+    const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
+
+    await expect(instance.listModels('antigravity')).resolves.toHaveLength(4)
+    await instance.listModels('antigravity')
+    expect(availableModels).toHaveBeenCalledTimes(1)
+  })
+
+  it('skips discovery when no credentials are stored', async () => {
+    const credentials = vi.fn(() => Promise.reject(new LlmError('not logged in', 'MISSING_CREDENTIAL')))
+    const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
+      models: { 'gemini-3.8-flash': {} },
+    }))
+    const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), credentials, undefined, availableModels)
+
+    await expect(instance.listModels('antigravity')).resolves.toHaveLength(4)
+    expect(availableModels).not.toHaveBeenCalled()
+  })
+
+  it('caches the discovered catalog across calls', async () => {
+    const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
+      models: { 'gemini-3.8-flash': {} },
+    }))
+    const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
+
+    const first = await instance.listModels('antigravity')
+    const second = await instance.listModels('antigravity')
+
+    expect(second).toEqual(first)
+    expect(availableModels).toHaveBeenCalledTimes(1)
   })
 })
 

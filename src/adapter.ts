@@ -4,6 +4,7 @@ import {
   buildAgyAgentRequestMetadata,
   buildAntigravityHarnessUserAgent,
   ensureProjectContext,
+  fetchAvailableModels,
   fetchWithAgyCliTransport,
   getPublicModelDefinitions,
   orderAgyRequestPayloadInPlace,
@@ -11,6 +12,7 @@ import {
   resolveModelForHeaderStyle,
   toGeminiSchema,
   type AgyRequestLabels,
+  type FetchAvailableModelsResponse,
 } from '@cortexkit/antigravity-auth-core'
 import {
   EMPTY_RESPONSE_CODE,
@@ -118,6 +120,11 @@ export interface AntigravityAdapterDeps {
   project?: typeof ensureProjectContext
   save?: typeof saveCredentials
   /**
+   * Upstream model catalog lookup used to discover models the bundled static
+   * table does not know yet. Overridable for tests.
+   */
+  availableModels?: typeof fetchAvailableModels
+  /**
    * Resolves the host's durable attachment store on demand. Hosts without the
    * attachment service resolve `undefined`, which keeps image input unavailable
    * instead of failing plugin load.
@@ -151,6 +158,71 @@ type ToolCallId = ToolCallBlock['id']
 const modelDefinitions = getPublicModelDefinitions()
 const geminiModels = Object.values(modelDefinitions)
   .filter(model => model.id.startsWith('antigravity-gemini-') && !model.modalities.output.includes('image'))
+
+/**
+ * How long a discovered upstream catalog stays authoritative. Long enough to
+ * keep the model picker off the network on every open, short enough that a
+ * newly released Gemini appears without restarting the host.
+ */
+const MODEL_DISCOVERY_TTL_MS = 15 * 60_000
+/** Retry delay after a failed lookup, so a flaky network cannot stall the picker. */
+const MODEL_DISCOVERY_RETRY_MS = 60_000
+const MODEL_DISCOVERY_TIMEOUT_MS = 5_000
+/** Upstream chat families this plugin serves; anything else stays out of the catalog. */
+const DISCOVERABLE_MODEL = /^gemini-\d+(?:\.\d+)?-(?:pro|flash)$/
+const MODEL_ID_NOISE = /-(?:preview|tiered|experimental)$/
+const MODEL_ID_TIER = /-(?:low|medium|high)$/
+const DEFAULT_CONTEXT_WINDOW = 1_048_576
+
+interface DiscoveredModel {
+  id: string
+  name: string
+}
+
+function humanizeModelId(id: string): string {
+  return id
+    .split('-')
+    .filter(segment => segment.length > 0)
+    .map(segment => segment[0]!.toUpperCase() + segment.slice(1))
+    .join(' ')
+}
+
+/**
+ * Normalize one upstream catalog payload. Tier and preview variants collapse
+ * onto their base id because this adapter expresses the tier through
+ * `reasoningEffort` instead of a separate model entry.
+ */
+function normalizeAvailableModels(response: FetchAvailableModelsResponse): readonly DiscoveredModel[] {
+  const models = response.models
+  if (models === undefined) return []
+  const found = new Map<string, DiscoveredModel>()
+  for (const [rawId, entry] of Object.entries(models)) {
+    const base = rawId
+      .trim()
+      .toLowerCase()
+      .replace(/^antigravity-/, '')
+      .replace(MODEL_ID_TIER, '')
+      .replace(MODEL_ID_NOISE, '')
+    if (!DISCOVERABLE_MODEL.test(base)) continue
+    const id = `antigravity-${base}`
+    if (found.has(id)) continue
+    const upstreamName = typeof entry?.displayName === 'string' ? entry.displayName.trim() : ''
+    const name = upstreamName.length > 0 ? upstreamName : humanizeModelId(base)
+    found.set(id, { id, name: name.includes('Antigravity') ? name : `${name} (Antigravity)` })
+  }
+  return [...found.values()]
+}
+
+function discoveredModelInfo(provider: string, model: DiscoveredModel): LlmResolvedModelInfo {
+  return {
+    provider,
+    id: model.id,
+    name: model.name,
+    inputModalities: ['text', 'image'],
+    context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
+    reasoning: reasoningEfforts(model.id),
+  }
+}
 
 function sanitize(text: string): string {
   return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
@@ -526,7 +598,11 @@ export class AntigravityAdapter extends LlmAdapter {
   private readonly project: typeof ensureProjectContext
   private readonly save: typeof saveCredentials
   private readonly attachments: () => AttachmentImageStore | undefined
+  private readonly availableModels: typeof fetchAvailableModels
   private readonly requestSessions = new AgyRequestSessionStore('')
+  private discovered: { at: number; models: readonly DiscoveredModel[] } | undefined
+  private pending: Promise<readonly DiscoveredModel[]> | undefined
+  private retryAfter = 0
 
   constructor(deps: AntigravityAdapterDeps = {}) {
     super()
@@ -534,6 +610,7 @@ export class AntigravityAdapter extends LlmAdapter {
     this.credentials = deps.credentials ?? credentialsForRequest
     this.project = deps.project ?? ensureProjectContext
     this.save = deps.save ?? saveCredentials
+    this.availableModels = deps.availableModels ?? fetchAvailableModels
     this.attachments = deps.attachments ?? (() => undefined)
   }
 
@@ -541,13 +618,69 @@ export class AntigravityAdapter extends LlmAdapter {
     return { id: provider, name: 'Google Antigravity' }
   }
 
-  override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(geminiModels.map(model => modelInfo(provider, model)))
+  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const known = geminiModels.map(model => modelInfo(provider, model))
+    const knownIds = new Set(known.map(info => info.id))
+    const discovered = (await this.discoveredModels())
+      .filter(model => !knownIds.has(model.id))
+      .map(model => discoveredModelInfo(provider, model))
+    return [...known, ...discovered]
   }
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const definition = modelDefinitions[model]
-    return Promise.resolve(definition ? modelInfo(provider, definition) : { provider, id: model, name: model })
+    if (definition) return modelInfo(provider, definition)
+    const match = (await this.discoveredModels()).find(entry => entry.id === model)
+    return match ? discoveredModelInfo(provider, match) : { provider, id: model, name: model }
+  }
+
+  /**
+   * Upstream catalog for models newer than the bundled static table. Failures
+   * are silent: the static catalog remains a usable answer, and a failed lookup
+   * is retried later instead of on every picker open.
+   */
+  private async discoveredModels(): Promise<readonly DiscoveredModel[]> {
+    const cached = this.discovered
+    if (cached !== undefined && Date.now() - cached.at < MODEL_DISCOVERY_TTL_MS) return cached.models
+    if (this.pending !== undefined) return this.pending
+    if (Date.now() < this.retryAfter) return cached?.models ?? []
+
+    const pending = this.fetchDiscoveredModels().then(
+      (models) => {
+        this.discovered = { at: Date.now(), models }
+        this.pending = undefined
+        return models
+      },
+      () => {
+        this.retryAfter = Date.now() + MODEL_DISCOVERY_RETRY_MS
+        this.pending = undefined
+        return cached?.models ?? []
+      },
+    )
+    this.pending = pending
+    return pending
+  }
+
+  private async fetchDiscoveredModels(): Promise<readonly DiscoveredModel[]> {
+    let credentials: StoredCredentials
+    try {
+      credentials = await this.credentials(false)
+    } catch {
+      return [] // Not logged in: nothing to discover against.
+    }
+    const context = await this.project({
+      type: 'oauth',
+      refresh: credentials.refresh,
+      access: credentials.access,
+      expires: credentials.expires,
+    })
+    const response = await this.availableModels({
+      accessToken: credentials.access,
+      projectId: context.effectiveProjectId,
+      endpoints: ANTIGRAVITY_ENDPOINT_FALLBACKS,
+      timeoutMs: MODEL_DISCOVERY_TIMEOUT_MS,
+    })
+    return normalizeAvailableModels(response)
   }
 
   private async readImagePart(ref: ImageAttachmentRef, signal: AbortSignal | undefined): Promise<GeminiPart> {

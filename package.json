@@ -1,6 +1,6 @@
 {
   "name": "dsh-antigravity-oauth",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "Google Antigravity OAuth Gemini provider for DeepSeek Harness",
   "homepage": "https://github.com/Eridani075/deepseek-harness-antigravity-oauth#readme",
   "repository": {
