@@ -616,6 +616,15 @@ function responseError(result: RequestResult, requestId: string): LlmError {
   })
 }
 
+/**
+ * Distinguishes "this host has no credentials" from "credentials exist but
+ * could not be produced right now". Only the first one justifies an empty
+ * catalog; the second is a transient failure to report as such.
+ */
+function isMissingCredentials(error: unknown): boolean {
+  return error instanceof LlmError && error.code === 'MISSING_CREDENTIAL'
+}
+
 export class AntigravityAdapter extends LlmAdapter {
   private readonly transport: typeof fetchWithAgyCliTransport
   private readonly credentials: typeof credentialsForRequest
@@ -665,7 +674,14 @@ export class AntigravityAdapter extends LlmAdapter {
    */
   private async discoveredModels(): Promise<readonly DiscoveredModel[]> {
     const cached = this.discovered
-    if (cached !== undefined && Date.now() - cached.at < MODEL_DISCOVERY_TTL_MS) return cached.models
+    // An empty catalog is also what an unauthenticated host reports, so it is
+    // held for the retry interval instead of the full TTL: logging in or a
+    // recovered network then reaches the picker within a minute rather than
+    // hiding the upstream models for fifteen.
+    const ttl = cached !== undefined && cached.models.length === 0
+      ? MODEL_DISCOVERY_RETRY_MS
+      : MODEL_DISCOVERY_TTL_MS
+    if (cached !== undefined && Date.now() - cached.at < ttl) return cached.models
     if (this.pending !== undefined) return this.pending
     if (Date.now() < this.retryAfter) return cached?.models ?? []
 
@@ -689,8 +705,14 @@ export class AntigravityAdapter extends LlmAdapter {
     let credentials: StoredCredentials
     try {
       credentials = await this.credentials(false)
-    } catch {
-      return [] // Not logged in: nothing to discover against.
+    } catch (error) {
+      // Having no credentials at all is the honest empty catalog. Every other
+      // failure — an expired token whose refresh could not reach Google, an
+      // unreadable file — is transient and must reject so the caller keeps
+      // serving the last good catalog instead of caching emptiness as a
+      // successful lookup for the whole TTL.
+      if (isMissingCredentials(error)) return []
+      throw error
     }
     const context = await this.project({
       type: 'oauth',
@@ -704,6 +726,11 @@ export class AntigravityAdapter extends LlmAdapter {
       endpoints: ANTIGRAVITY_ENDPOINT_FALLBACKS,
       timeoutMs: MODEL_DISCOVERY_TIMEOUT_MS,
     })
+    // A response that omits the field is a degraded answer, not an empty
+    // catalog, and must not blank out models discovered earlier.
+    if (response.models === undefined) {
+      throw new LlmError('Antigravity model catalog response carried no models field', 'PROVIDER')
+    }
     return normalizeAvailableModels(response)
   }
 

@@ -69,6 +69,7 @@ function adapter(
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllEnvs()
 })
 
@@ -515,6 +516,81 @@ describe('AntigravityAdapter upstream model discovery', () => {
 
     expect(second).toEqual(first)
     expect(availableModels).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the last good catalog when the credential refresh fails', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
+        models: { 'gemini-3.8-flash-medium': {} },
+      }))
+      const credentials = vi.fn<NonNullable<AntigravityAdapterDeps['credentials']>>(
+        () => Promise.resolve(stored),
+      )
+      const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), credentials, undefined, availableModels)
+      await expect(instance.listModels('antigravity')).resolves.toHaveLength(5)
+
+      // The stored token expired and the refresh never reached Google. That is
+      // not "not logged in", so the catalog already discovered must survive it.
+      credentials.mockRejectedValueOnce(new LlmError('Antigravity OAuth token refresh failed', 'PROVIDER'))
+      vi.setSystemTime(Date.now() + 16 * 60_000)
+
+      const models = await instance.listModels('antigravity')
+
+      expect(models.map(model => model.id)).toContain('antigravity-gemini-3.8-flash')
+      // The failed refresh never reached the catalog endpoint.
+      expect(availableModels).toHaveBeenCalledTimes(1)
+
+      // Recovery, not a fifteen-minute outage: the next attempt after the
+      // retry interval reaches the catalog again.
+      credentials.mockClear()
+      vi.setSystemTime(Date.now() + 61_000)
+
+      await expect(instance.listModels('antigravity')).resolves.toHaveLength(5)
+      expect(availableModels).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('treats a catalog response without the models field as a failure', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
+        models: { 'gemini-3.8-flash-medium': {} },
+      }))
+      const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
+      await expect(instance.listModels('antigravity')).resolves.toHaveLength(5)
+
+      // A degraded answer must not blank out what a healthy one discovered.
+      availableModels.mockResolvedValueOnce({})
+      vi.setSystemTime(Date.now() + 16 * 60_000)
+
+      await expect(instance.listModels('antigravity')).resolves.toHaveLength(5)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries an empty catalog after the retry interval, not the full TTL', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(
+        async () => ({ models: {} }),
+      )
+      const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
+      await expect(instance.listModels('antigravity')).resolves.toHaveLength(4)
+
+      // An empty catalog is what a host that is not logged in reports, so a
+      // login has to become visible within the retry interval.
+      availableModels.mockResolvedValueOnce({ models: { 'gemini-3.8-flash-medium': {} } })
+      vi.setSystemTime(Date.now() + 61_000)
+
+      await expect(instance.listModels('antigravity')).resolves.toHaveLength(5)
+      expect(availableModels).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
