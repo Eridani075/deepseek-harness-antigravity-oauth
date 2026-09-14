@@ -260,7 +260,22 @@ npm run pack
 ```
 
 tarball 会写入 `artifacts/`；该目录中的 `*.tgz` 已被 `.gitignore` 忽略。发布到 GitHub 时，建议
-将 tarball 作为 GitHub Release 附件，而不是提交到源码仓库。
+将 tarball 作为 GitHub Release 附件，而不是提交到源码仓库：
+
+```bash
+git tag -a v0.3.2 -m "v0.3.2" && git push origin v0.3.2
+gh release create v0.3.2 artifacts/dsh-antigravity-oauth-0.3.2.tgz \
+  --title v0.3.2 --notes-file /tmp/release-notes-v0.3.2.md
+```
+
+Release 正文用中英双语：中文段按新功能、修复、文档、兼容性、安装、校验分节，英文段与之一一对应，
+末尾附 `npm run check` 结果、产物文件名、文件数和 SHA-256。发布后核对附件 digest 与本地一致：
+
+```bash
+gh api repos/Eridani075/deepseek-harness-antigravity-oauth/releases/tags/v0.3.2 \
+  --jq '.assets[] | .name + " " + .digest'
+shasum -a 256 artifacts/dsh-antigravity-oauth-0.3.2.tgz
+```
 
 ## License
 
