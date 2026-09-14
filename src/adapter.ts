@@ -42,11 +42,17 @@ export const PROVIDER = 'antigravity'
 
 const STREAM_ACTION = 'streamGenerateContent'
 const IDLE_TIMEOUT_MS = 5 * 60_000
+// Antigravity occasionally answers with a bare `finishReason: STOP` and no
+// parts. The request is cheap to repeat and nothing has been emitted yet, so
+// the whole attempt is retried before the empty-response error surfaces.
+const EMPTY_RESPONSE_ATTEMPTS = 3
+const EMPTY_RESPONSE_RETRY_DELAY_MS = 250
 
 type GeminiPart =
   | { text: string; thought?: boolean; thoughtSignature?: string }
   | { functionCall: { name: string; args: Record<string, unknown>; id: string }; thoughtSignature?: string }
   | { functionResponse: { name: string; response: Record<string, unknown>; id: string } }
+  | { inlineData: { mimeType: string; data: string } }
 
 interface GeminiContent {
   role: 'user' | 'model'
@@ -81,7 +87,7 @@ interface GeminiUsageMetadata {
 
 export interface GeminiStreamChunk {
   candidates?: Array<{
-    content?: { parts?: GeminiResponsePart[] }
+    content?: { role?: string; parts?: GeminiResponsePart[] }
     finishReason?: string
   }>
   usageMetadata?: GeminiUsageMetadata
@@ -112,7 +118,29 @@ export interface AntigravityAdapterDeps {
   credentials?: typeof credentialsForRequest
   project?: typeof ensureProjectContext
   save?: typeof saveCredentials
+  /**
+   * Resolves the host's durable attachment store on demand. Hosts without the
+   * attachment service resolve `undefined`, which keeps image input unavailable
+   * instead of failing plugin load.
+   */
+  attachments?: () => AttachmentImageStore | undefined
 }
+
+/** The subset of the host attachment store this adapter reads. */
+export interface AttachmentImageStore {
+  readImage(ref: ImageAttachmentRef, signal?: AbortSignal): Promise<StoredImage>
+}
+
+/** Durable image reference carried by a user image block. */
+type ImageAttachmentRef = Extract<ContentBlock, { type: 'image' }>['attachment']
+
+/** Verified bytes returned by the host attachment store. */
+interface StoredImage {
+  ref: ImageAttachmentRef
+  data: Uint8Array
+}
+
+type ImageReader = (ref: ImageAttachmentRef) => Promise<GeminiPart>
 
 const modelDefinitions = getPublicModelDefinitions()
 const geminiModels = Object.values(modelDefinitions)
@@ -120,6 +148,16 @@ const geminiModels = Object.values(modelDefinitions)
 
 function sanitize(text: string): string {
   return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
+}
+
+/**
+ * AGY's GPT bridge re-encodes protobuf numeric constraints as strings before
+ * OpenAI JSON-Schema validation, so `minLength: 1` arrives as `'1'` and the
+ * whole request fails with 400 INVALID_ARGUMENT. Core moves those constraints
+ * into the description for its `gpt-oss-*` family; mirror that rule here.
+ */
+function usesGptOssSchema(model: string): boolean {
+  return model.toLowerCase().replace(/^antigravity-/, '').startsWith('gpt-oss-')
 }
 
 function reasoningEfforts(model: string) {
@@ -134,7 +172,7 @@ function modelInfo(provider: string, model: (typeof geminiModels)[number]): LlmR
     provider,
     id: model.id,
     name: model.name,
-    inputModalities: ['text'],
+    inputModalities: ['text', 'image'],
     context: { contextWindow: model.limit.context },
     defaultMaxTokens: model.limit.output,
     reasoning: reasoningEfforts(model.id),
@@ -212,10 +250,15 @@ function textFromBlocks(blocks: readonly ContentBlock[]): string {
   return text.join('\n')
 }
 
-function buildGeminiRequest(options: GenerateOptions): GeminiRequest {
+async function buildGeminiRequest(options: GenerateOptions, readImage: ImageReader | undefined): Promise<GeminiRequest> {
   const contents: GeminiContent[] = []
   const system: string[] = options.system?.trim() ? [options.system.trim()] : []
   const calls = new Map<string, { name: string; target: boolean }>()
+  const effort = options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort)
+  const resolved = resolveModelForHeaderStyle(
+    effort === undefined ? options.model : `${options.model}-${effort}`,
+    'antigravity',
+  )
 
   for (const message of options.messages) {
     if (message.role !== 'assistant') continue
@@ -267,6 +310,11 @@ function buildGeminiRequest(options: GenerateOptions): GeminiRequest {
     for (const block of message.content) {
       if (block.type === 'text') {
         if (block.text) parts.push({ text: sanitize(block.text) })
+      } else if (block.type === 'image') {
+        if (!readImage) {
+          throw new LlmError('Antigravity image input requires the host attachment service', 'UNSUPPORTED_CONTENT')
+        }
+        parts.push(await readImage(block.attachment))
       } else {
         throw new LlmError(`Unsupported user content block: ${block.type}`, 'UNSUPPORTED_CONTENT')
       }
@@ -277,11 +325,14 @@ function buildGeminiRequest(options: GenerateOptions): GeminiRequest {
   const request: GeminiRequest = { contents }
   if (system.length > 0) request.systemInstruction = { parts: [{ text: sanitize(system.join('\n\n')) }] }
   if (options.tools?.length) {
+    const schemaOptions = usesGptOssSchema(resolved.actualModel)
+      ? { moveNumericConstraintsToDescription: true }
+      : undefined
     request.tools = [{
       functionDeclarations: options.tools.map(tool => ({
         name: tool.name,
         description: tool.description,
-        parameters: toGeminiSchema(tool.parameters),
+        parameters: toGeminiSchema(tool.parameters, schemaOptions),
       })),
     }]
     request.toolConfig = { functionCallingConfig: { mode: 'VALIDATED' } }
@@ -292,17 +343,12 @@ function buildGeminiRequest(options: GenerateOptions): GeminiRequest {
   if (options.maxTokens !== undefined) generationConfig.maxOutputTokens = options.maxTokens
   if (options.stop !== undefined) generationConfig.stopSequences = options.stop
 
-  const effort = options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort)
   if (effort !== undefined && !['low', 'medium', 'high'].includes(effort)) {
     throw new LlmError(`Unsupported Antigravity reasoning effort: ${effort}`, 'UNSUPPORTED_REASONING_EFFORT')
   }
   if (effort === 'medium' && options.model.includes('-pro')) {
     throw new LlmError(`${options.model} supports only low and high reasoning`, 'UNSUPPORTED_REASONING_EFFORT')
   }
-  const resolved = resolveModelForHeaderStyle(
-    effort === undefined ? options.model : `${options.model}-${effort}`,
-    'antigravity',
-  )
   if (resolved.thinkingLevel) {
     generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: resolved.thinkingLevel }
   } else if (resolved.thinkingBudget !== undefined) {
@@ -320,6 +366,25 @@ function unwrapChunk(raw: unknown): GeminiStreamChunk {
   return raw as GeminiStreamChunk
 }
 
+/**
+ * Upstream frames are not always valid Gemini events: GPT-OSS opens with a
+ * candidate whose `content` omits `parts`, and Claude sometimes labels the role
+ * `assistant` where Gemini allows only `user` or `model`. Repair both at the
+ * parse boundary so every consumer of this exported parser sees the schema it
+ * expects.
+ */
+function normalizeChunk(chunk: GeminiStreamChunk): GeminiStreamChunk {
+  if (chunk === null || typeof chunk !== 'object') return chunk
+  for (const candidate of chunk.candidates ?? []) {
+    if (candidate === null || typeof candidate !== 'object') continue
+    const content = candidate.content as { role?: string; parts?: GeminiResponsePart[] } | null | undefined
+    if (content === null || typeof content !== 'object') continue
+    if (content.role !== undefined && content.role !== 'user' && content.role !== 'model') content.role = 'model'
+    if (!Array.isArray(content.parts)) content.parts = []
+  }
+  return chunk
+}
+
 export async function* parseGeminiSse(response: Response): AsyncGenerator<GeminiStreamChunk> {
   if (!response.body) return
   const reader = response.body.getReader()
@@ -334,7 +399,7 @@ export async function* parseGeminiSse(response: Response): AsyncGenerator<Gemini
       .trim()
     if (!data || data === '[DONE]') return undefined
     try {
-      return unwrapChunk(JSON.parse(data))
+      return normalizeChunk(unwrapChunk(JSON.parse(data)))
     } catch (error: unknown) {
       throw new LlmError('Antigravity returned malformed SSE JSON', 'TRANSPORT', { cause: error })
     }
@@ -399,6 +464,18 @@ function retryAfterMs(response: Response): number | undefined {
   return Number.isFinite(date) && delay > 0 ? delay : undefined
 }
 
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise(resolve => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
 function errorFacts(body: string | undefined): { message?: string; reason?: string } {
   if (!body) return {}
   try {
@@ -442,6 +519,7 @@ export class AntigravityAdapter extends LlmAdapter {
   private readonly credentials: typeof credentialsForRequest
   private readonly project: typeof ensureProjectContext
   private readonly save: typeof saveCredentials
+  private readonly attachments: () => AttachmentImageStore | undefined
   private readonly requestSessions = new AgyRequestSessionStore('')
 
   constructor(deps: AntigravityAdapterDeps = {}) {
@@ -450,6 +528,7 @@ export class AntigravityAdapter extends LlmAdapter {
     this.credentials = deps.credentials ?? credentialsForRequest
     this.project = deps.project ?? ensureProjectContext
     this.save = deps.save ?? saveCredentials
+    this.attachments = deps.attachments ?? (() => undefined)
   }
 
   override providerInfo(provider: string) {
@@ -465,13 +544,44 @@ export class AntigravityAdapter extends LlmAdapter {
     return Promise.resolve(definition ? modelInfo(provider, definition) : { provider, id: model, name: model })
   }
 
-  private prepare(options: GenerateOptions, project: string) {
+  private async readImagePart(ref: ImageAttachmentRef, signal: AbortSignal | undefined): Promise<GeminiPart> {
+    const store = this.attachments()
+    if (!store) {
+      throw new LlmError('Antigravity image input requires the host attachment service', 'UNSUPPORTED_CONTENT')
+    }
+    let stored: StoredImage
+    try {
+      stored = await store.readImage(ref, signal)
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new LlmError(`Antigravity cannot read image attachment (${detail})`, 'UNSUPPORTED_CONTENT', {
+        cause: error,
+      })
+    }
+    return { inlineData: { mimeType: stored.ref.mediaType, data: Buffer.from(stored.data).toString('base64') } }
+  }
+
+  /** Memoizes attachment reads so one image referenced twice is fetched once per request. */
+  private imageReader(signal: AbortSignal | undefined): ImageReader {
+    const cache = new Map<string, Promise<GeminiPart>>()
+    return ref => {
+      const key = String(ref.attachmentId)
+      let part = cache.get(key)
+      if (!part) {
+        part = this.readImagePart(ref, signal)
+        cache.set(key, part)
+      }
+      return part
+    }
+  }
+
+  private async prepare(options: GenerateOptions, project: string) {
     const effort = options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort)
     const resolved = resolveModelForHeaderStyle(
       effort === undefined ? options.model : `${options.model}-${effort}`,
       'antigravity',
     )
-    const request = buildGeminiRequest(options)
+    const request = await buildGeminiRequest(options, this.imageReader(options.signal))
     const scope = this.requestSessions.beginRequest(String(options.sessionId ?? '__default__'))
     const metadata = buildAgyAgentRequestMetadata(
       scope.session,
@@ -534,7 +644,7 @@ export class AntigravityAdapter extends LlmAdapter {
       credentials = { ...credentials, refresh: context.auth.refresh }
       await this.save(credentials)
     }
-    const prepared = this.prepare(options, context.effectiveProjectId)
+    const prepared = await this.prepare(options, context.effectiveProjectId)
     let result = await this.send(prepared.body, credentials.access, options.signal)
     if (result.response.status === 401) {
       credentials = await this.credentials(true)
@@ -545,141 +655,151 @@ export class AntigravityAdapter extends LlmAdapter {
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     if (options.signal?.aborted) throw new LlmError('Antigravity request aborted', 'ABORTED')
-    let response: Response | undefined
-    try {
-      const request = await this.response(options)
-      if (!request.result.response.ok) throw responseError(request.result, request.requestId)
-      response = request.result.response
+    for (let attempt = 1; ; attempt += 1) {
+      let response: Response | undefined
+      try {
+        const request = await this.response(options)
+        if (!request.result.response.ok) throw responseError(request.result, request.requestId)
+        response = request.result.response
 
-      let nextIndex = 0
-      let text: { index: number; value: string } | undefined
-      let reasoning: { index: number; value: string } | undefined
-      let pendingThoughtSignature: string | undefined
-      let terminal: string | undefined
-      let usage: TokenUsage | undefined
-      let hasContent = false
-      let hasToolCall = false
-      const replayBlocks: ReplayBlock[] = []
+        let nextIndex = 0
+        let text: { index: number; value: string } | undefined
+        let reasoning: { index: number; value: string } | undefined
+        let pendingThoughtSignature: string | undefined
+        let terminal: string | undefined
+        let usage: TokenUsage | undefined
+        let hasContent = false
+        let hasToolCall = false
+        const replayBlocks: ReplayBlock[] = []
 
-      const closeText = (): StreamChunk[] => {
-        if (!text) return []
-        const current = text
-        text = undefined
-        return [{ type: 'block-end', index: current.index, block: { type: 'text', text: current.value } }]
-      }
-      const closeReasoning = (): StreamChunk[] => {
-        if (!reasoning) return []
-        const current = reasoning
-        reasoning = undefined
-        return [{ type: 'block-end', index: current.index, block: { type: 'reasoning', text: current.value } }]
-      }
+        const closeText = (): StreamChunk[] => {
+          if (!text) return []
+          const current = text
+          text = undefined
+          return [{ type: 'block-end', index: current.index, block: { type: 'text', text: current.value } }]
+        }
+        const closeReasoning = (): StreamChunk[] => {
+          if (!reasoning) return []
+          const current = reasoning
+          reasoning = undefined
+          return [{ type: 'block-end', index: current.index, block: { type: 'reasoning', text: current.value } }]
+        }
 
-      for await (const chunk of parseGeminiSse(response)) {
-        const failure = embeddedFailure(chunk)
-        if (failure) throw new LlmError(failure, 'PROVIDER')
-        if (chunk.usageMetadata) usage = usageOf(chunk.usageMetadata)
-        const candidate = chunk.candidates?.[0]
+        for await (const chunk of parseGeminiSse(response)) {
+          const failure = embeddedFailure(chunk)
+          if (failure) throw new LlmError(failure, 'PROVIDER')
+          if (chunk.usageMetadata) usage = usageOf(chunk.usageMetadata)
+          const candidate = chunk.candidates?.[0]
 
-        for (const part of candidate?.content?.parts ?? []) {
-          if (part.thought && !part.functionCall && !part.text && part.thoughtSignature) {
-            const openIndex = text?.index
-            if (openIndex !== undefined) replayBlocks[openIndex] = { type: 'text', thoughtSignature: part.thoughtSignature }
-            else pendingThoughtSignature = part.thoughtSignature
-            continue
-          }
-
-          if (part.functionCall) {
-            for (const event of closeText()) yield event
-            for (const event of closeReasoning()) yield event
-            const id = CallId(part.functionCall.id ?? `call_${randomUUID()}`)
-            const name = part.functionCall.name ?? ''
-            const argumentsText = JSON.stringify(part.functionCall.args ?? {})
-            const index = nextIndex++
-            const signature = part.thoughtSignature ?? pendingThoughtSignature
-            pendingThoughtSignature = undefined
-            replayBlocks[index] = { type: 'tool-call', ...(signature ? { thoughtSignature: signature } : {}) }
-            yield { type: 'block-start', index, blockType: 'tool-call' }
-            yield { type: 'tool-call-delta', index, id, name, argumentsDelta: argumentsText }
-            const block: ToolCallBlock = { type: 'tool-call', id, name, arguments: argumentsText }
-            yield { type: 'block-end', index, block }
-            hasContent = true
-            hasToolCall = true
-            continue
-          }
-
-          if (part.thought) {
-            if (!part.text) continue
-            for (const event of closeText()) yield event
-            if (!reasoning) {
-              const index = nextIndex++
-              reasoning = { index, value: '' }
-              replayBlocks[index] = {
-                type: 'reasoning',
-                ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
-              }
-              yield { type: 'block-start', index, blockType: 'reasoning' }
+          for (const part of candidate?.content?.parts ?? []) {
+            if (part.thought && !part.functionCall && !part.text && part.thoughtSignature) {
+              const openIndex = text?.index
+              if (openIndex !== undefined) replayBlocks[openIndex] = { type: 'text', thoughtSignature: part.thoughtSignature }
+              else pendingThoughtSignature = part.thoughtSignature
+              continue
             }
-            reasoning.value += part.text
-            if (part.thoughtSignature) {
-              replayBlocks[reasoning.index] = { type: 'reasoning', thoughtSignature: part.thoughtSignature }
-            }
-            yield { type: 'reasoning-delta', index: reasoning.index, text: part.text }
-            hasContent = true
-            continue
-          }
 
-          if (part.text) {
-            for (const event of closeReasoning()) yield event
-            if (!text) {
+            if (part.functionCall) {
+              for (const event of closeText()) yield event
+              for (const event of closeReasoning()) yield event
+              const id = CallId(part.functionCall.id ?? `call_${randomUUID()}`)
+              const name = part.functionCall.name ?? ''
+              const argumentsText = JSON.stringify(part.functionCall.args ?? {})
               const index = nextIndex++
               const signature = part.thoughtSignature ?? pendingThoughtSignature
               pendingThoughtSignature = undefined
-              text = { index, value: '' }
-              replayBlocks[index] = { type: 'text', ...(signature ? { thoughtSignature: signature } : {}) }
-              yield { type: 'block-start', index, blockType: 'text' }
+              replayBlocks[index] = { type: 'tool-call', ...(signature ? { thoughtSignature: signature } : {}) }
+              yield { type: 'block-start', index, blockType: 'tool-call' }
+              yield { type: 'tool-call-delta', index, id, name, argumentsDelta: argumentsText }
+              const block: ToolCallBlock = { type: 'tool-call', id, name, arguments: argumentsText }
+              yield { type: 'block-end', index, block }
+              hasContent = true
+              hasToolCall = true
+              continue
             }
-            text.value += part.text
-            if (part.thoughtSignature) replayBlocks[text.index] = { type: 'text', thoughtSignature: part.thoughtSignature }
-            yield { type: 'text-delta', index: text.index, text: part.text }
-            hasContent = true
+
+            if (part.thought) {
+              if (!part.text) continue
+              for (const event of closeText()) yield event
+              if (!reasoning) {
+                const index = nextIndex++
+                reasoning = { index, value: '' }
+                replayBlocks[index] = {
+                  type: 'reasoning',
+                  ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
+                }
+                yield { type: 'block-start', index, blockType: 'reasoning' }
+              }
+              reasoning.value += part.text
+              if (part.thoughtSignature) {
+                replayBlocks[reasoning.index] = { type: 'reasoning', thoughtSignature: part.thoughtSignature }
+              }
+              yield { type: 'reasoning-delta', index: reasoning.index, text: part.text }
+              hasContent = true
+              continue
+            }
+
+            if (part.text) {
+              for (const event of closeReasoning()) yield event
+              if (!text) {
+                const index = nextIndex++
+                const signature = part.thoughtSignature ?? pendingThoughtSignature
+                pendingThoughtSignature = undefined
+                text = { index, value: '' }
+                replayBlocks[index] = { type: 'text', ...(signature ? { thoughtSignature: signature } : {}) }
+                yield { type: 'block-start', index, blockType: 'text' }
+              }
+              text.value += part.text
+              if (part.thoughtSignature) replayBlocks[text.index] = { type: 'text', thoughtSignature: part.thoughtSignature }
+              yield { type: 'text-delta', index: text.index, text: part.text }
+              hasContent = true
+            }
+          }
+
+          if (candidate?.finishReason) {
+            terminal = candidate.finishReason
+            break
           }
         }
 
-        if (candidate?.finishReason) {
-          terminal = candidate.finishReason
-          break
+        for (const event of closeText()) yield event
+        for (const event of closeReasoning()) yield event
+        if (options.signal?.aborted) throw new LlmError('Antigravity request aborted', 'ABORTED')
+        if (!terminal) throw new LlmError('Antigravity stream ended without a terminal response', 'TRANSPORT')
+        if (!hasContent) throw new LlmError('Antigravity returned an empty response', EMPTY_RESPONSE_CODE)
+        if (usage) yield { type: 'usage', usage }
+
+        const reason = hasToolCall
+          ? { kind: 'tool-calls' as const }
+          : terminal === 'MAX_TOKENS'
+            ? { kind: 'max-tokens' as const }
+            : { kind: 'stop' as const }
+        if (reason.kind !== 'tool-calls') this.requestSessions.completeExecution(String(options.sessionId ?? '__default__'))
+        const replayState: ReplayState = {
+          kind: 'dsh-antigravity-oauth',
+          version: 1,
+          provider: options.provider,
+          model: options.model,
+          blocks: replayBlocks,
         }
+        yield { type: 'finish', reason, replayState }
+        return
+      } catch (error: unknown) {
+        if (options.signal?.aborted && !(error instanceof LlmError && error.code === 'ABORTED')) {
+          throw new LlmError('Antigravity request aborted', 'ABORTED', { cause: error })
+        }
+        // Only an empty response is retried, and only because it is raised before
+        // any chunk reaches the caller: repeating the request cannot duplicate output.
+        if (attempt < EMPTY_RESPONSE_ATTEMPTS && error instanceof LlmError && error.code === EMPTY_RESPONSE_CODE) {
+          await sleep(EMPTY_RESPONSE_RETRY_DELAY_MS * attempt, options.signal)
+          if (options.signal?.aborted) throw new LlmError('Antigravity request aborted', 'ABORTED')
+          continue
+        }
+        if (error instanceof LlmError) throw error
+        throw new LlmError('Antigravity transport failed', 'TRANSPORT', { cause: error })
+      } finally {
+        await response?.body?.cancel().catch(() => {})
       }
-
-      for (const event of closeText()) yield event
-      for (const event of closeReasoning()) yield event
-      if (options.signal?.aborted) throw new LlmError('Antigravity request aborted', 'ABORTED')
-      if (!terminal) throw new LlmError('Antigravity stream ended without a terminal response', 'TRANSPORT')
-      if (!hasContent) throw new LlmError('Antigravity returned an empty response', EMPTY_RESPONSE_CODE)
-      if (usage) yield { type: 'usage', usage }
-
-      const reason = hasToolCall
-        ? { kind: 'tool-calls' as const }
-        : terminal === 'MAX_TOKENS'
-          ? { kind: 'max-tokens' as const }
-          : { kind: 'stop' as const }
-      if (reason.kind !== 'tool-calls') this.requestSessions.completeExecution(String(options.sessionId ?? '__default__'))
-      const replayState: ReplayState = {
-        kind: 'dsh-antigravity-oauth',
-        version: 1,
-        provider: options.provider,
-        model: options.model,
-        blocks: replayBlocks,
-      }
-      yield { type: 'finish', reason, replayState }
-    } catch (error: unknown) {
-      if (options.signal?.aborted && !(error instanceof LlmError && error.code === 'ABORTED')) {
-        throw new LlmError('Antigravity request aborted', 'ABORTED', { cause: error })
-      }
-      if (error instanceof LlmError) throw error
-      throw new LlmError('Antigravity transport failed', 'TRANSPORT', { cause: error })
-    } finally {
-      await response?.body?.cancel().catch(() => {})
     }
   }
 }
