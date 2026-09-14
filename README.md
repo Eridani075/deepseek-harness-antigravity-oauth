@@ -54,9 +54,18 @@ antigravity-gemini-3.1-pro
 ## 兼容性
 
 - Node.js 20 或更高版本
-- `@deepseek-ai/dsh@0.1.0-rc.6` 开发/验证版本
+- `@deepseek-ai/dsh@0.1.0-rc.6` 开发/验证基线
+- 安装验证：`dsh` CLI `0.1.5-rc.1`（`@deepseek-ai/dsh-*` `0.1.5-rc.2`）
 - OAuth 和 transport 由 [cortexkit/antigravity-auth](https://github.com/cortexkit/antigravity-auth)
   提供
+
+dsh 在测试阶段会有破坏性更新。插件已适配以下变更，并同时兼容新旧宿主：
+
+| 变更 | 旧宿主 | 新宿主 | 插件做法 |
+| --- | --- | --- | --- |
+| tool call id 类型 | `CallId` | `ToolCallId` | 从 `ToolCallBlock['id']` 推导，不导入品牌函数 |
+| settings 命名空间 | `settingsNamespace()` | 仅接受字面量 | 使用 `'llm-antigravity-oauth'` 字面量 |
+| 前端 Context 类型 | `dsh-client-runtime/client` | `@deepseek-ai/cordis` | 从 cordis 导入 `Context` 类型 |
 
 ## 安装
 
@@ -163,6 +172,11 @@ Settings → Models。
 宿主没有提供 durable attachment service，插件无法读取图片字节。确认当前 DSH 版本包含 attachment
 服务（Web profile 默认包含），并检查该图片是否仍在 attachment 存储中。若图片读取失败，错误信息会
 带上底层原因，例如附件已被清理。
+
+### 启动时报 `does not provide an export named ...`
+
+dsh 测试阶段会重命名或移除导出，例如 `CallId` → `ToolCallId`、移除 `settingsNamespace`。先升级插件
+到最新版本；仍报错时，在 issue 中附上 `dsh --version` 和完整报错。不要附带任何 OAuth 凭据。
 
 ### `User location is not supported for the API use`
 

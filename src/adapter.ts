@@ -13,7 +13,6 @@ import {
   type AgyRequestLabels,
 } from '@cortexkit/antigravity-auth-core'
 import {
-  CallId,
   EMPTY_RESPONSE_CODE,
   LlmAdapter,
   LlmError,
@@ -141,6 +140,13 @@ interface StoredImage {
 }
 
 type ImageReader = (ref: ImageAttachmentRef) => Promise<GeminiPart>
+
+/**
+ * Provider-issued tool-call id. Derived from the host block type instead of
+ * importing the brand helper, whose name differs across host versions
+ * (`CallId` in 0.1.0-rc.6, `ToolCallId` in 0.1.5-rc.x).
+ */
+type ToolCallId = ToolCallBlock['id']
 
 const modelDefinitions = getPublicModelDefinitions()
 const geminiModels = Object.values(modelDefinitions)
@@ -702,7 +708,7 @@ export class AntigravityAdapter extends LlmAdapter {
             if (part.functionCall) {
               for (const event of closeText()) yield event
               for (const event of closeReasoning()) yield event
-              const id = CallId(part.functionCall.id ?? `call_${randomUUID()}`)
+              const id = (part.functionCall.id ?? `call_${randomUUID()}`) as ToolCallId
               const name = part.functionCall.name ?? ''
               const argumentsText = JSON.stringify(part.functionCall.args ?? {})
               const index = nextIndex++

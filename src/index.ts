@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { AntigravityAdapter, PROVIDER } from './adapter.js'
 import { AntigravityAuthService } from './web-auth.js'
 
@@ -11,7 +11,12 @@ export { AntigravityAuthService } from './web-auth.js'
 export const name = 'llm-antigravity-oauth'
 export const inject = ['llm']
 
-const SETTINGS_NS = settingsNamespace('llm-antigravity-oauth')
+/**
+ * Lowercase-hyphenated literal rather than the `settingsNamespace()` helper,
+ * which dsh 0.1.5 no longer exports. The brand is type-level only: 0.1.0-rc.6
+ * brands the return value, 0.1.5 constrains the literal at the call site.
+ */
+const SETTINGS_NS = 'llm-antigravity-oauth' as SettingsNamespace
 const PROVIDER_SETTINGS_PATH = ['providers', PROVIDER] as const
 const PROVIDER_ENTRY = {
   provider: PROVIDER,

@@ -5,7 +5,6 @@ import {
 } from '@cortexkit/antigravity-auth-core'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, {
-  CallId,
   ReasoningEffortId,
   attributionHeaders,
   createAssistantMessage,
@@ -14,6 +13,7 @@ import LlmRuntime, {
   type ContentBlock,
   type GenerateOptions,
   type StreamChunk,
+  type ToolCallBlock,
 } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import * as Plugin from '../src/index.js'
@@ -143,7 +143,7 @@ describe('AntigravityAdapter', () => {
   })
 
   it('replays thought signatures and tool results losslessly', async () => {
-    const callId = CallId('call_history')
+    const callId = 'call_history' as ToolCallBlock['id']
     const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
       candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }],
     })))
@@ -335,6 +335,33 @@ describe('AntigravityAdapter', () => {
     const gemini = JSON.parse(String(transport.mock.calls[1]?.[1]?.body))
     expect(gemini.request.tools[0].functionDeclarations[0].parameters.properties.query)
       .toEqual({ type: 'STRING', minLength: 1 })
+  })
+
+  it('resolves full model metadata for the model picker', async () => {
+    const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>())
+
+    await expect(instance.resolveModel('antigravity', MODEL)).resolves.toMatchObject({
+      provider: 'antigravity',
+      id: MODEL,
+      inputModalities: ['text', 'image'],
+      context: { contextWindow: 1_048_576 },
+      defaultMaxTokens: 65_536,
+      reasoning: {
+        efforts: [
+          { id: 'low', name: 'Low' },
+          { id: 'medium', name: 'Medium' },
+          { id: 'high', name: 'High' },
+        ],
+      },
+    })
+    await expect(instance.resolveModel('antigravity', 'antigravity-gemini-3.1-pro')).resolves.toMatchObject({
+      reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] },
+    })
+    await expect(instance.resolveModel('antigravity', 'antigravity-unknown')).resolves.toEqual({
+      provider: 'antigravity',
+      id: 'antigravity-unknown',
+      name: 'antigravity-unknown',
+    })
   })
 
   it('unregisters its provider when the plugin fiber is disposed', async () => {
