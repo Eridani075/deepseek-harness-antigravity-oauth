@@ -54,6 +54,10 @@ antigravity-<上游新增模型>      例如 antigravity-gemini-3.8-flash
 
 - 上游模型名去掉 `antigravity-` 前缀后就是请求使用的 model id；`-preview`、`-tiered`、`-low/-medium/-high`
   等后缀会归一化，tier 通过 reasoning effort 选择，因此不会出现重复条目。
+- 只注册「插件实际会发送的 wire id 在上游目录里存在」的模型，所以显示名一定对应真正被调用的模型；
+  上游目录里的别名不会造成错标（例如键 `gemini-2.5-flash` 的上游显示名是 "Gemini 3.5 Flash Lite"），
+  解析器无法忠实转换的家族（`*-flash-lite`、无 tier 的 `gemini-3-flash`）也不会进入选择器。
+- 显示名由模型 id 推导，因为上游 displayName 会随返回顺序变化（3.8 Flash 时而标 `(Low)` 时而标 `(Medium)`）。
 - 结果缓存 15 分钟；查询失败时回退到内置列表，并在 60 秒内不再重试，避免模型选择器卡在网络上。
 - 未登录或上游不可达时使用内置列表，所以选择器不会为空。
 - 只注册 Gemini `*-pro` / `*-flash` 文本模型；图像生成、Claude、gpt-oss 等上游条目不在本插件范围内。

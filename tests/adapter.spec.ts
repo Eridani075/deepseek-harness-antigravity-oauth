@@ -396,16 +396,28 @@ describe('AntigravityAdapter', () => {
 })
 
 describe('AntigravityAdapter upstream model discovery', () => {
-  it('merges upstream models the bundled table does not know yet', async () => {
+  it('merges the upstream catalog the bundled table does not know yet', async () => {
     const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
       models: {
-        'gemini-3.7-flash': { displayName: 'Gemini 3.7 Flash' },
-        'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash' },
-        'gemini-3.8-flash-high': {},
-        'gemini-3.9-pro': {},
+        // Static families arrive as tier variants and must collapse onto the known id.
+        'gemini-3.7-flash-medium': {},
+        'gemini-3.7-flash-high': {},
+        // Newer families the bundled table cannot know about.
+        'gemini-3.8-flash-low': {},
+        'gemini-3.8-flash-medium': {},
+        'gemini-3.8-flash-tiered': {},
+        'gemini-3.9-pro-low': {},
+        'gemini-3.9-pro-high': {},
+        // Aliased key whose upstream label names a different model.
+        'gemini-2.5-flash': { displayName: 'Gemini 3.5 Flash Lite' },
+        // Families the request path cannot address exactly, or out of scope.
+        'gemini-3.5-flash-lite': { displayName: 'Gemini 3.5 Flash Lite' },
+        'gemini-3-flash': {},
         'gemini-3.1-flash-image': { displayName: 'Nano Banana' },
-        'gpt-oss-120b-medium': { displayName: 'GPT-OSS 120B' },
-        'claude-sonnet-4-6-thinking': { displayName: 'Claude Sonnet' },
+        'gpt-oss-120b-medium': {},
+        'claude-sonnet-4-6-thinking': {},
+        'chat_20706': {},
+        'tab_jump_flash_lite_preview': {},
       },
     }))
     const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
@@ -417,14 +429,17 @@ describe('AntigravityAdapter upstream model discovery', () => {
       'antigravity-gemini-3.6-flash',
       'antigravity-gemini-3.5-flash',
       'antigravity-gemini-3.1-pro',
-      'antigravity-gemini-3.8-flash',
       'antigravity-gemini-3.9-pro',
+      'antigravity-gemini-3.8-flash',
+      'antigravity-gemini-2.5-flash',
     ])
     expect(models.at(-2)).toMatchObject({
       provider: 'antigravity',
       name: 'Gemini 3.8 Flash (Antigravity)',
       inputModalities: ['text', 'image'],
     })
+    // Names come from the id, not from an upstream label that names another model.
+    expect(models.at(-1)).toMatchObject({ id: 'antigravity-gemini-2.5-flash', name: 'Gemini 2.5 Flash (Antigravity)' })
     await expect(instance.resolveModel('antigravity', 'antigravity-gemini-3.9-pro')).resolves.toMatchObject({
       name: 'Gemini 3.9 Pro (Antigravity)',
       context: { contextWindow: 1_048_576 },
@@ -437,7 +452,7 @@ describe('AntigravityAdapter upstream model discovery', () => {
       candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
     })))
     const instance = adapter(transport, undefined, undefined, async () => ({
-      models: { 'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash' } },
+      models: { 'gemini-3.8-flash-medium': {}, 'gemini-3.8-flash-high': {} },
     }))
 
     await collect(instance.stream(options({
@@ -463,7 +478,7 @@ describe('AntigravityAdapter upstream model discovery', () => {
   it('skips discovery when no credentials are stored', async () => {
     const credentials = vi.fn(() => Promise.reject(new LlmError('not logged in', 'MISSING_CREDENTIAL')))
     const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
-      models: { 'gemini-3.8-flash': {} },
+      models: { 'gemini-3.8-flash-medium': {} },
     }))
     const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), credentials, undefined, availableModels)
 
@@ -473,7 +488,7 @@ describe('AntigravityAdapter upstream model discovery', () => {
 
   it('caches the discovered catalog across calls', async () => {
     const availableModels = vi.fn<NonNullable<AntigravityAdapterDeps['availableModels']>>(async () => ({
-      models: { 'gemini-3.8-flash': {} },
+      models: { 'gemini-3.8-flash-medium': {} },
     }))
     const instance = adapter(vi.fn<typeof fetchWithAgyCliTransport>(), undefined, undefined, availableModels)
 

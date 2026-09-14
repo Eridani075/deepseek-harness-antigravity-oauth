@@ -187,30 +187,40 @@ function humanizeModelId(id: string): string {
     .join(' ')
 }
 
+function modelVersion(id: string): number {
+  const match = /^antigravity-gemini-(\d+(?:\.\d+)?)-/u.exec(id)
+  return match ? Number(match[1]) : 0
+}
+
 /**
- * Normalize one upstream catalog payload. Tier and preview variants collapse
- * onto their base id because this adapter expresses the tier through
- * `reasoningEffort` instead of a separate model entry.
+ * Normalize one upstream catalog payload.
+ *
+ * The upstream catalog lists tier-specific keys and aliases whose display names
+ * do not always match their key (`gemini-2.5-flash` is labeled "Gemini 3.5 Flash
+ * Lite"), and its key order varies between calls. So this normalization:
+ *
+ * - collapses tier variants onto their base id, because this adapter expresses
+ *   the tier through `reasoningEffort`;
+ * - registers a model only when the exact wire id the request path would send
+ *   exists upstream, which keeps families the resolver cannot address faithfully
+ *   (`*-flash-lite`, untiered `gemini-3-flash`) out of the picker;
+ * - derives names from the id instead of the upstream display name, so labels
+ *   are deterministic and match the model that will actually be called.
  */
 function normalizeAvailableModels(response: FetchAvailableModelsResponse): readonly DiscoveredModel[] {
   const models = response.models
   if (models === undefined) return []
+  const keys = new Set(Object.keys(models).map(key => key.trim().toLowerCase()))
   const found = new Map<string, DiscoveredModel>()
-  for (const [rawId, entry] of Object.entries(models)) {
-    const base = rawId
-      .trim()
-      .toLowerCase()
-      .replace(/^antigravity-/, '')
-      .replace(MODEL_ID_TIER, '')
-      .replace(MODEL_ID_NOISE, '')
-    if (!DISCOVERABLE_MODEL.test(base)) continue
-    const id = `antigravity-${base}`
-    if (found.has(id)) continue
-    const upstreamName = typeof entry?.displayName === 'string' ? entry.displayName.trim() : ''
-    const name = upstreamName.length > 0 ? upstreamName : humanizeModelId(base)
-    found.set(id, { id, name: name.includes('Antigravity') ? name : `${name} (Antigravity)` })
+  for (const rawId of keys) {
+    const base = rawId.replace(MODEL_ID_TIER, '').replace(MODEL_ID_NOISE, '')
+    if (!DISCOVERABLE_MODEL.test(base) || found.has(base)) continue
+    const wireId = resolveModelForHeaderStyle(`antigravity-${base}`, 'antigravity').actualModel
+    if (!keys.has(wireId)) continue
+    found.set(base, { id: `antigravity-${base}`, name: `${humanizeModelId(base)} (Antigravity)` })
   }
-  return [...found.values()]
+  return [...found.values()].sort((left, right) => modelVersion(right.id) - modelVersion(left.id)
+    || left.id.localeCompare(right.id))
 }
 
 function discoveredModelInfo(provider: string, model: DiscoveredModel): LlmResolvedModelInfo {
