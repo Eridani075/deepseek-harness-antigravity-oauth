@@ -48,7 +48,11 @@ function providerProfiles(value: unknown): Record<string, unknown> {
 export function apply(ctx: Context): void {
   const authService = new AntigravityAuthService(ctx)
   const providerRegistration = ctx.llm.registerConfigurableProviders([PROVIDER_ENTRY])
-  const adapterRegistration = ctx.llm.registerAdapter([PROVIDER], new AntigravityAdapter())
+  // Resolved per request: the attachment service may load after this plugin.
+  const adapterRegistration = ctx.llm.registerAdapter(
+    [PROVIDER],
+    new AntigravityAdapter({ attachments: () => ctx.get('attachments') }),
+  )
   ctx.inject(['settings'], scope => {
     const settings = scope.settings.register(SETTINGS_NS, SettingsConfig, { base: {} })
     const initial = settings.get()
