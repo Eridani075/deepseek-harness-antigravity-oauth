@@ -178,6 +178,24 @@ Settings → Models。
 dsh 测试阶段会重命名或移除导出，例如 `CallId` → `ToolCallId`、移除 `settingsNamespace`。先升级插件
 到最新版本；仍报错时，在 issue 中附上 `dsh --version` 和完整报错。不要附带任何 OAuth 凭据。
 
+### `Antigravity token exchange failed: fetch failed`
+
+登录时插件先用授权码换取 token（`oauth2.googleapis.com`），随后**尽力**读取 userinfo 用于显示邮箱。
+如果 `www.googleapis.com` 不可达（被网络屏蔽，或代理只放行了部分 Google 域名），旧版本会把整个
+登录判定为失败。0.2.6 起 userinfo 失败不再影响登录，只是不显示邮箱。
+
+浏览器能打开 Google 授权页不代表 DSH 宿主机进程也能访问这些域名，两者出口可能不同。宿主机必须能访问：
+
+- `oauth2.googleapis.com`：换取和刷新 token，必需
+- `cloudcode-pa.googleapis.com` 或 `daily-cloudcode-pa.sandbox.googleapis.com`：模型请求，必需
+
+`www.googleapis.com` 只影响邮箱显示。验证连通性：
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" https://oauth2.googleapis.com/token
+curl -sS -o /dev/null -w "%{http_code}\n" https://cloudcode-pa.googleapis.com/
+```
+
 ### `User location is not supported for the API use`
 
 这是 Google 对请求出口地区的限制。请使用 Google 支持地区的代理出口。Antigravity core 会读取

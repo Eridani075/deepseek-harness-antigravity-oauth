@@ -10,6 +10,7 @@ import {
   startOAuthCallbackServer,
   type OAuthCallbackServer,
 } from './oauth-callback.js'
+import { describeExchangeFailure, exchangeAntigravityResilient } from './oauth-exchange.js'
 
 type AntigravityAuthState =
   | { status: 'idle' }
@@ -42,7 +43,7 @@ export interface AntigravityAuthServiceDeps {
 
 const defaultDeps: AntigravityAuthServiceDeps = {
   authorize: authorizeAntigravity,
-  exchange: exchangeAntigravity,
+  exchange: exchangeAntigravityResilient,
   listen: startOAuthCallbackServer,
   load: loadCredentials,
   save: saveCredentials,
@@ -161,7 +162,7 @@ export class AntigravityAuthService extends TypertRemoteService {
       if (callback === undefined) throw new Error('Google authorization timed out')
       const result = await this.deps.exchange(callback.code, callback.state)
       if (this.listener !== listener) return
-      if (result.type === 'failed') throw new Error(`Antigravity token exchange failed: ${result.error}`)
+      if (result.type === 'failed') throw new Error(describeExchangeFailure(result.error))
       await this.deps.save({
         version: 1,
         refresh: result.refresh,

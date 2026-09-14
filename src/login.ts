@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 
-import {
-  authorizeAntigravity,
-  exchangeAntigravity,
-} from '@cortexkit/antigravity-auth-core'
+import { authorizeAntigravity } from '@cortexkit/antigravity-auth-core'
 import { createInterface } from 'node:readline/promises'
 import { stdin, stdout } from 'node:process'
 import { credentialFilePath, saveCredentials } from './auth.js'
 import { startOAuthCallbackServer } from './oauth-callback.js'
+import { describeExchangeFailure, exchangeAntigravityResilient } from './oauth-exchange.js'
 
 function callbackInput(value: string, fallbackState: string): { code: string; state: string } {
   const input = value.trim()
@@ -51,8 +49,8 @@ async function main(): Promise<void> {
       stdout.write('\nAutomatic callback timed out; paste the callback URL or authorization code.\n')
       callback = await manual
     }
-    const result = await exchangeAntigravity(callback.code, callback.state)
-    if (result.type === 'failed') throw new Error(`Antigravity token exchange failed: ${result.error}`)
+    const result = await exchangeAntigravityResilient(callback.code, callback.state)
+    if (result.type === 'failed') throw new Error(describeExchangeFailure(result.error))
     await saveCredentials({
       version: 1,
       refresh: result.refresh,
