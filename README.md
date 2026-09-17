@@ -1,99 +1,59 @@
 # DeepSeek Harness Antigravity OAuth
 
-将 Google Antigravity 账号中的 Gemini 模型接入
+把 Google Antigravity 账号里的 Gemini 模型接进
 [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/)，作为原生 LLM provider 使用。
 
 - Provider ID：`antigravity`
 - 运行方式：DSH Web profile 插件
-- 认证方式：Google OAuth，本机保存 refresh token
+- 认证方式：Google OAuth，refresh token 保存在本机
 
 > [!WARNING]
-> 本插件调用 Antigravity 的非公开内部 API，不是 Google 官方 Gemini API 集成。使用它可能违反
-> Google 服务条款，也可能导致账号受限或封禁。请自行评估风险，不要使用重要账号。Google 或
-> Antigravity 的协议变更可能随时使插件失效。
-
-## 免责声明
-
-本项目及其作者与 Google、DeepSeek 或 Antigravity 官方没有隶属、授权或赞助关系。
-
-本插件仅供学习和技术研究使用。用户须自行确认其所在地区的法律法规、Google 服务条款以及相关账号政策，并自行承担使用本插件产生的全部风险，包括但不限于账号限制、服务中断、数据丢失或其他损失。
-
-本项目调用的接口属于非公开接口，作者不保证其长期可用性、稳定性或兼容性，也不承诺为因接口变化、账号策略变化或第三方服务故障导致的问题提供修复。
-
-请勿将 OAuth callback URL、authorization code、access token、refresh token 或其他敏感信息提交到 issue、日志、截图或公开仓库。
+> 本插件调用 Antigravity 的非公开内部 API，不是 Google 官方 Gemini API 集成，与 Google、DeepSeek、
+> Antigravity 官方均无隶属或赞助关系。使用可能违反 Google 服务条款并导致账号受限或封禁，请自行评估
+> 风险，不要使用重要账号；接口可能随时失效，作者不保证长期可用性。请勿将 OAuth callback URL、
+> authorization code、access token、refresh token 或任何其他敏感信息提交到 issue、日志、截图或公开仓库。
 
 ## 功能
 
-- Gemini 文本生成、thinking 和 tool calls/results
+- Gemini 文本生成、thinking、tool calls / tool results，流式响应与 usage
 - 图像输入：图片附件以 Gemini `inlineData` 内联发送
-- 流式响应、usage、abort、自动刷新 token 和失败重试
-- Web UI 设置页直接唤起 Google 登录，并自动接收 OAuth callback
-- Models 设置页删除/恢复 provider
-- Antigravity 设置页退出登录并删除本机 OAuth 凭据
+- Web UI 设置页直接唤起 Google 登录并自动接收本机 OAuth callback
+- 自动刷新 token、失败重试；Models 设置页可删除/恢复 provider
 
-模型声明 `text` 和 `image` 输入模态，因此模型选择器和附件通道会把图片正常下发。当前不支持 PDF
-输入和多账号轮换；图像生成模型不会注册到模型选择器。
-
-PDF 之所以不可用，不是 Antigravity 的限制（上游支持 `application/pdf` 的 `inlineData`），而是
-DSH 的附件通道只保存位图：`image/png`、`image/jpeg`、`image/webp`、`image/gif`，没有 PDF
-内容块可以下发。
+不支持 PDF 输入和多账号轮换（DSH 附件通道只保存位图，没有 PDF 内容块可下发）；图像生成模型不会注册
+到模型选择器。
 
 ## 模型
 
-登录后插件会调用上游的 `v1internal:fetchAvailableModels` 获取当前账号可用的模型，并与内置列表合并：
+登录后插件调用上游 `v1internal:fetchAvailableModels` 获取当前账号可用的模型，并与内置列表合并。
+内置列表用于未登录或上游不可达时的回退，因此选择器不会为空：
 
 ```text
 antigravity-gemini-3.7-flash
 antigravity-gemini-3.6-flash
 antigravity-gemini-3.5-flash
 antigravity-gemini-3.1-pro
-antigravity-<上游新增模型>      例如 antigravity-gemini-3.8-flash
 ```
 
-上游新增 Gemini 文本模型（`*-pro` / `*-flash`）时，模型选择器里会自动出现，**不需要更新插件**：
+上游新增 Gemini 文本模型（`*-pro` / `*-flash`）时选择器里会自动出现，不需要更新插件。模型名去掉
+`antigravity-` 前缀后就是请求使用的 model id；`-preview`、`-tiered`、`-low/-medium/-high` 等后缀会
+归一化，tier 通过 reasoning effort 选择。只注册「插件实际会发送的 wire id 在上游目录里存在」的模型，
+所以显示名一定对应真正被调用的模型；图像生成、Claude、gpt-oss 等上游条目不在本插件范围内。
 
-- 上游模型名去掉 `antigravity-` 前缀后就是请求使用的 model id；`-preview`、`-tiered`、`-low/-medium/-high`
-  等后缀会归一化，tier 通过 reasoning effort 选择，因此不会出现重复条目。
-- 只注册「插件实际会发送的 wire id 在上游目录里存在」的模型，所以显示名一定对应真正被调用的模型；
-  上游目录里的别名不会造成错标（例如键 `gemini-2.5-flash` 的上游显示名是 "Gemini 3.5 Flash Lite"），
-  解析器无法忠实转换的家族（`*-flash-lite`、无 tier 的 `gemini-3-flash`）也不会进入选择器。
-- 显示名由模型 id 推导，因为上游 displayName 会随返回顺序变化（3.8 Flash 时而标 `(Low)` 时而标 `(Medium)`）。
-- 结果缓存 15 分钟；查询失败时回退到内置列表，并在 60 秒内不再重试，避免模型选择器卡在网络上。
-- 未登录或上游不可达时使用内置列表，所以选择器不会为空。
-- 只注册 Gemini `*-pro` / `*-flash` 文本模型；图像生成、Claude、gpt-oss 等上游条目不在本插件范围内。
+结果缓存 15 分钟；查询失败时回退内置列表，并在 60 秒内不再重试，避免模型选择器卡在网络上。
 
 `*-pro` 支持 `low` 和 `high` reasoning effort；其他模型支持 `low`、`medium` 和 `high`。
 
 ## 兼容性
 
-- Node.js 20 或更高版本
-- 开发/验证基线：`dsh` CLI `0.1.5-rc.1`，`@deepseek-ai/dsh-*@0.1.5-rc.2`
-- OAuth 和 transport 由 [cortexkit/antigravity-auth](https://github.com/cortexkit/antigravity-auth)
-  提供
+**只支持当前 dsh 发行版**：Node.js 20 或更高版本，宿主需为 `0.1.5-rc` 线（开发与验证基线：`dsh` CLI
+`0.1.5-rc.1`，`@deepseek-ai/dsh-*@0.1.5-rc.2`）。dsh 还在测试阶段，每个 rc 都可能破坏插件，本项目不为
+旧宿主保留兼容分支：宿主升级时跟着升级插件；还停在 `0.1.0-rc.x` 宿主的请先升级 dsh 本身。
 
-**只支持当前 dsh 发行版**。dsh 还在测试阶段，每个 rc 都可能破坏插件，本项目不再为旧宿主保留兼容分支：
-0.4.0 起最低要求 `0.1.5-rc` 线的宿主（开发与验证都对着 `0.1.5-rc.2`）。宿主升级时跟着升级插件；还停在
-`0.1.0-rc.x` 宿主的请先升级 dsh 本身。
+宿主提供的包（`@deepseek-ai/*`）在 `package.json` 里全部是 **optional** peer dependency，插件运行时只
+import 宿主进程里的那一份，不会随插件安装自己的副本——副本会让宿主认不出插件注册的类（见「故障排查」）。
 
-宿主提供的包（`@deepseek-ai/*`）在 `package.json` 里全部是 **optional** peer dependency，插件运行时
-只 import 宿主进程里那一份，不会随插件安装自己的副本。Peer 里的版本范围（`^0.1.5-rc.2`）只表示开发
-基线，不代表兼容上限：按 semver 规则，预发布版本只在同一个 `major.minor.patch` 三元组内互相匹配，
-把范围写准这件事在 rc 阶段并不存在。0.3.3 及更早版本把这些 peer 声明成必需项，`autoInstallPeers=true`
-的包管理器会装进一整套旧副本（见「故障排查」的「登录按钮报 HTTP 404」）。
-
-插件依赖的宿主契约（宿主 API 变化时按这份清单核对）：
-
-| 依赖 | 插件做法 |
-| --- | --- |
-| `dsh-typert-protocol` 用原型上的标记读取 `@Remote` 方法 | 不自行实现标记读写，只 import 宿主那一份；出现副本会导致 `/api/*` 全线 404 |
-| LLM 派发经 `LlmAdapter.prepareCall()` 两步式入口 | 只实现 `stream()`，不覆盖 `prepareCall` |
-| tool call id 是 `@deepseek-ai/dsh-llm/brand` 的品牌类型 | 用 `ToolCallId()` 构造，不导入也不自造别名 |
-| settings 命名空间只接受字面量（`settingsNamespace()` 已移除） | 使用 `'llm-antigravity-oauth'` 字面量 |
-| 前端 `Context` 来自 `@deepseek-ai/cordis`，slot 注册走 `ctx.slots`（由 `dsh-client-ui-renderer` 声明），设置分区契约由 `dsh-client-ui-settings` 声明 | 只做 type-only import，slot 与设置分区按契约注册 |
-| `replayState` 是宿主的 `ReplayEnvelope`：`response` 放适配器私有元数据，`blocks` 与消息块一一对应 | 版本头放在 `response` 里；`blocks` 与发出的块数一致，宿主截断时会同步裁剪 |
-
-插件在加载时自检 `dsh-llm` 与 `dsh-typert-protocol`：解析到非宿主副本时会在启动日志里直接点名版本和
-路径（而不是只留一个 404）。自检对「无法判断」的情况保持静默。
+OAuth 和 transport 由 [cortexkit/antigravity-auth](https://github.com/cortexkit/antigravity-auth) 提供。
 
 ## 安装
 
@@ -107,12 +67,11 @@ dsh plugin --profile web add "/absolute/path/to/dsh-antigravity-oauth-VERSION.tg
 dsh --profile web --dump-config
 ```
 
-用 pnpm 9 时需要给 `add` 显式加 `-w`，否则 pnpm 会把 profile 当成 workspace root 并拒绝安装
-（`ERR_PNPM_ADDING_TO_ROOT`）：`dsh plugin --profile web add -w "<tgz>"`。
+`--dump-config` 输出中应出现 `dsh-antigravity-oauth` bundle 和 `llm-antigravity-oauth` 条目。安装或升级
+插件后重启已经运行的 DSH Web 服务再刷新浏览器；已经有服务占用 `127.0.0.1:3080` 时不要启动第二个
+`dsh web`。
 
 ### 从源码构建
-
-在项目目录执行：
 
 ```bash
 npm ci
@@ -120,34 +79,24 @@ npm run check
 npm run pack
 ```
 
-产物位于 `artifacts/`。安装生成的 tarball：
+产物位于 `artifacts/`，再按上面的命令安装生成的 tarball。
 
-```bash
-dsh plugin --profile web add "/absolute/path/to/artifacts/dsh-antigravity-oauth-VERSION.tgz"
-dsh --profile web --dump-config
-```
+### 注意事项
 
-`--dump-config` 输出中应出现 `dsh-antigravity-oauth` bundle 和
-`llm-antigravity-oauth` 条目。安装或升级插件后，重启已经运行的 DSH Web 服务再刷新浏览器；
-不要在已有服务占用 `127.0.0.1:3080` 时重复启动第二个 `dsh web`。
-
-安装时 `pnpm` 可能提示缺少 `hono`、`arctic`（来自 `@cortexkit/antigravity-auth-core` 的传递依赖），
-它们不在本插件使用的 OAuth/transport 路径中；只要 bundle 能正常加载，就不需要为了消除提示而把这些依赖
-重复安装到 profile。DSH 的 peer dependency 从 0.3.4 起全部是 optional，pnpm 和 npm 都不会自动安装，
-因此也不会再出现「缺少 DSH peer dependencies」的提示。
-
-profile 的 `pnpm-workspace.yaml` 里 dsh 写了 `autoInstallPeers: false` 和 `nodeLinker: hoisted`，但
-**pnpm 9 只从这个文件读 `packages:`**，设置项要 pnpm 10 才生效（pnpm 9 读 `.npmrc`）。装 0.3.4 不受
-影响（peer 已是 optional）；0.3.3 及更早版本在 pnpm 9 下会因此多装 100 多个包，也就是下面「登录按钮报
-HTTP 404」的成因。
+- 用 pnpm 9 时 `add` 需要显式加 `-w`（pnpm 会把 profile 当成 workspace root 并拒绝安装）：
+  `dsh plugin --profile web add -w "<tgz>"`。
+- 安装时 pnpm 可能提示缺少 `hono`、`arctic`（`@cortexkit/antigravity-auth-core` 的传递依赖），它们不在
+  本插件使用的 OAuth/transport 路径上，bundle 能正常加载就不必理会。
+- 插件的 DSH peer dependency 全部是 optional，pnpm 和 npm 都不会自动安装，也不会出现「缺少 DSH peer
+  dependencies」这类提示。
 
 ## 登录
 
 ### Web UI
 
-打开 DSH Web UI 的 Settings → Antigravity，点击「登录 Google」并完成授权。插件会在 DSH Host
-侧监听本机 OAuth callback 并自动保存凭据，正常情况下不需要手动复制 code。浏览器阻止新标签页时，
-页面会提供一次性的「打开授权页面」按钮。
+Settings → Antigravity →「登录 Google」，完成授权即可，插件会在 DSH Host 侧监听本机 OAuth callback 并
+自动保存凭据，正常情况下不需要手动复制 code。浏览器阻止新标签页时，页面会提供一次性的「打开授权页面」
+按钮。
 
 ### CLI
 
@@ -155,119 +104,59 @@ HTTP 404」的成因。
 dsh plugin --profile web exec dsh-antigravity-login
 ```
 
-CLI 会监听 `127.0.0.1:51121` 并打印 Google OAuth URL。授权完成后 callback 会自动交给 CLI；如果
-自动 callback 失败，可以粘贴完整 callback URL 或 authorization code。
+CLI 监听 `127.0.0.1:51121` 并打印 Google OAuth URL；授权完成后 callback 自动交给 CLI，自动 callback 失败
+时可以粘贴完整 callback URL 或 authorization code。
 
-凭据默认保存到：
+凭据默认保存到 `${DSH_HOME:-~/.dsh}/antigravity-oauth.json`（POSIX 上权限为 `0600`），可用
+`DSH_ANTIGRAVITY_AUTH_FILE` 指定其他路径。
 
-```text
-${DSH_HOME:-~/.dsh}/antigravity-oauth.json
-```
+## 使用与凭据管理
 
-可以通过 `DSH_ANTIGRAVITY_AUTH_FILE` 指定其他路径。POSIX 系统上的凭据文件权限会设置为 `0600`。
+在模型选择器中选择 `antigravity` provider 及上述模型 ID。
 
-## Provider 和凭据管理
-
-登录后，在模型选择器中选择 `antigravity` provider 和上面的模型 ID。
-
-### 删除或恢复 provider
-
-Settings → Models 中的 Google Antigravity provider 使用 DSH 原生 Delete 操作：
-
-- Delete 会移除 provider 配置并停用 adapter，但保留 OAuth 凭据文件。
-- Settings → Antigravity 中的「启用提供商」可以恢复 provider，无需重新登录。
-
-### 退出登录
-
-Settings → Antigravity →「退出登录」会删除本机 OAuth 凭据文件，但不会撤销 Google 账号侧的应用
-授权。重新使用模型前需要再次登录。
+- **删除或恢复 provider**：Settings → Models 里的 Google Antigravity 使用 DSH 原生 Delete 操作，会移除
+  provider 配置并停用 adapter，但保留 OAuth 凭据；Settings → Antigravity 的「启用提供商」可以恢复，
+  无需重新登录。
+- **退出登录**：Settings → Antigravity →「退出登录」删除本机凭据文件，但不会撤销 Google 账号侧的应用
+  授权；再次使用模型前需要重新登录。
 
 ## 故障排查
 
 ### 模型没有出现在模型选择器
 
-确认插件安装到当前使用的 profile，并检查：
+确认插件装到了当前使用的 profile，并检查 `dsh --profile web --dump-config` 的输出包含
+`dsh-antigravity-oauth` 和 `llm-antigravity-oauth`，然后重启 DSH Web 服务并重新打开 Settings → Models。
 
-```bash
-dsh --profile web --dump-config
-```
+### 登录按钮报 HTTP 404，或 `registration.adapter.prepareCall is not a function`
 
-确认输出包含 `dsh-antigravity-oauth` 和 `llm-antigravity-oauth` 后，重启 DSH Web 服务并重新打开
-Settings → Models。
+两个报错是同一个原因：插件的 `node_modules` 里存在第二份 `@deepseek-ai/dsh-*`，插件 import 的是旧副本，
+宿主认不出它注册的类——Remote 方法标记落在旧副本里，`/api/antigravityAuth/*` 全部 404；旧副本的基类没有
+`prepareCall()`，模型调用直接抛错。插件加载时会自检这两个包，解析到非宿主副本时直接写进启动日志并点名
+版本和路径。加载时若没有告警，就不是这个问题。
 
-### 登录按钮报 HTTP 404
-
-点「登录 Google」报 `transport failure for /api/antigravityAuth/start: HTTP 404`，跑模型报
-`registration.adapter.prepareCall is not a function`——这两个报错是同一个原因：插件的
-`node_modules` 里存在第二份 `@deepseek-ai/dsh-*`，插件 import 的是旧副本，宿主认不出它注册的类。
-
-- `dsh-typert-protocol` 存 Remote 标记的位置在两代之间变了（模块私有 `WeakMap` → 原型属性），插件用旧
-  副本打标记、宿主用自己那份读，方法列表为空，所以 `/api/antigravityAuth/*` 全部 404。Service 本身是
-  可见的，插件也能正常加载，只有端点没被认领。
-- `LlmAdapter` 的两步式入口 `prepareCall()` 只存在于新宿主的基类上，旧副本的基类没有这个方法，于是
-  `registration.adapter.prepareCall is not a function`。
-
-0.3.3 及更早版本在 `autoInstallPeers=true` 的包管理器下必然触发（pnpm 9 读不到 dsh 写在
-`pnpm-workspace.yaml` 里的 `autoInstallPeers: false`，见上一节）。0.3.4 起 peer 全部 optional，不再
-安装副本；加载时还会自检这两个包，解析到非宿主副本时直接写进启动日志：
-
-```text
-antigravity: private copies of the DSH host packages shadow the host installation — @deepseek-ai/dsh-llm 0.1.0-rc.8 at …, not the host's 0.1.5-rc.2 at …
-```
-
-修复办法（按推荐顺序）：
-
-1. 升级到 0.3.4 或更高版本重装，多余的副本会在重装时被清掉。
-2. 留在旧版本：在 profile 目录放一个 pnpm 9 也读的 `.npmrc`，然后重装。
-   ```bash
-   printf 'auto-install-peers=false\n' >> "${DSH_HOME:-$HOME/.dsh}/profiles/web/.npmrc"
-   ```
-   同一个版本号重装时 pnpm 会报 “Already up to date” 而不重新解析，需要先删掉
-   `profiles/web/node_modules/dsh-antigravity-oauth` 以及 `pnpm-lock.yaml` 里对应的条目。
-3. pnpm 10 及以上不受影响：`pnpm-workspace.yaml` 里的设置生效，本来就不会装 peer。
-
-判断当前是否踩中，看 profile 里有没有第二份副本：
+检查 profile 里有没有第二份副本：
 
 ```bash
 ls "${DSH_HOME:-$HOME/.dsh}"/profiles/web/node_modules/.pnpm/node_modules/@deepseek-ai 2>/dev/null
 ```
 
-有输出（`dsh-llm`、`dsh-typert-protocol` 等）就是中招；`@deepseek-ai/*` 正确解到
-`${DSH_HOME:-$HOME/.dsh}/profiles/node_modules/@deepseek-ai` 那份时不会有这个目录。
-
-### `EADDRINUSE: 127.0.0.1:3080`
-
-已有 DSH Web 服务正在运行。刷新已有页面即可；需要加载新插件版本时，重启旧服务后再打开，
-不要并行启动第二个 `dsh web`。
-
-### `EADDRINUSE: 127.0.0.1:51121`
-
-退出旧的 `dsh-antigravity-login`，确认 OAuth callback 端口释放后再重试。
-
-### `Antigravity image input requires the host attachment service`
-
-宿主没有提供 durable attachment service，插件无法读取图片字节。确认当前 DSH 版本包含 attachment
-服务（Web profile 默认包含），并检查该图片是否仍在 attachment 存储中。若图片读取失败，错误信息会
-带上底层原因，例如附件已被清理。
+有输出就是中招；升级到 0.4.0 或更高版本重装即可（peer 已是 optional，副本会在重装时被清掉）。同一个
+版本号重装时 pnpm 会报 “Already up to date” 而不重新解析依赖，需要先删掉 profile 里的插件目录和
+`pnpm-lock.yaml` 中对应的条目。
 
 ### 启动时报 `does not provide an export named ...`
 
-dsh 在 rc 之间会重命名或移除导出（例如 `CallId` → `ToolCallId`，以及移除 `settingsNamespace()`）。插件
-只对当前宿主版本开发，所以这类报错的处理方式是**升级插件**（如果是升级 dsh 之后出现的）；仍报错时，
-在 issue 中附上 `dsh --version` 和完整报错。不要附带任何 OAuth 凭据。
+dsh 在 rc 之间会重命名或移除导出。插件只对当前宿主版本开发，这类报错的处理方式是**升级插件**（尤其是
+升级 dsh 之后出现的）；仍报错时在 issue 中附上 `dsh --version` 和完整报错，不要附带任何 OAuth 凭据。
 
-### `Antigravity token exchange failed: fetch failed`
-
-登录时插件先用授权码换取 token（`oauth2.googleapis.com`），随后**尽力**读取 userinfo 用于显示邮箱。
-如果 `www.googleapis.com` 不可达（被网络屏蔽，或代理只放行了部分 Google 域名），旧版本会把整个
-登录判定为失败。0.2.6 起 userinfo 失败不再影响登录，只是不显示邮箱。
+### `Antigravity token exchange failed: fetch failed` 或其他网络错误
 
 浏览器能打开 Google 授权页不代表 DSH 宿主机进程也能访问这些域名，两者出口可能不同。宿主机必须能访问：
 
 - `oauth2.googleapis.com`：换取和刷新 token，必需
 - `cloudcode-pa.googleapis.com` 或 `daily-cloudcode-pa.sandbox.googleapis.com`：模型请求，必需
 
-`www.googleapis.com` 只影响邮箱显示。验证连通性：
+`www.googleapis.com` 只用于显示账号邮箱，不可达只会导致不显示邮箱。验证连通性：
 
 ```bash
 curl -sS -o /dev/null -w "%{http_code}\n" https://oauth2.googleapis.com/token
@@ -276,90 +165,29 @@ curl -sS -o /dev/null -w "%{http_code}\n" https://cloudcode-pa.googleapis.com/
 
 ### `User location is not supported for the API use`
 
-这是 Google 对**请求出口**的地区限制，判断依据是 DSH 宿主机进程的出口 IP，浏览器能打开授权页不代表
-宿主机出口可用，两者可能走不同线路。
+这是 Google 对**请求出口**的地区限制，判断依据是 DSH 宿主机进程的出口 IP，而且限制按节点而非按国家
+生效：同一个国家不同机房的节点可能一个被拒、一个正常。遇到时先确认出口（`curl -sS https://ipinfo.io/json`），
+再固定一个能通过的节点（关闭自动测速/轮换），或给 DSH 显式指定代理：
 
-关键点是**限制按节点生效，而不是按国家生效**：实测同一台机器上，一个美国机房节点被拒（HTTP 400
-`FAILED_PRECONDITION`），换成另一个节点（日本）后连续请求全部成功。所以遇到这个错误时：
+```bash
+HTTPS_PROXY=http://127.0.0.1:7890 NO_PROXY=127.0.0.1,localhost dsh web
+```
 
-1. 查看宿主机出口并多测几次，确认节点是否在轮换：
-   ```bash
-   curl -sS https://ipinfo.io/json
-   ```
-2. 找到一个能通过的节点后固定它（关闭自动测速/轮换），或者给 DSH 显式指定代理：
-   ```bash
-   HTTPS_PROXY=http://127.0.0.1:7890 \
-   NO_PROXY=127.0.0.1,localhost \
-   dsh web
-   ```
-3. 换节点后如果仍然报同样的错，说明该节点出口被拒绝，继续换；这个错误无法通过重试自动恢复。
+换节点后仍报同样的错说明该节点出口被拒绝，重试不会自动恢复。插件会在错误信息后附带同样的提示。
 
-插件会在错误信息后附带同样的提示，便于和其他 400 区分。
+### `EADDRINUSE: 127.0.0.1:3080` / `127.0.0.1:51121`
 
-### OAuth 或模型请求出现 `fetch failed`
+端口已被占用：前者是已有 DSH Web 服务在跑（刷新已有页面即可，需要加载新插件版本时重启旧服务），后者是
+旧的 `dsh-antigravity-login` 还活着，退出后重试。
 
-检查 DSH Host 能否访问 Google OAuth 和 Antigravity endpoint，再检查代理、证书和网络出口。
-不要把 OAuth callback URL、authorization code、access token 或 refresh token 提交到 issue。
+### `Antigravity image input requires the host attachment service`
+
+宿主没有提供 attachment service，插件无法读取图片字节。确认当前 DSH 版本包含该服务（Web profile 默认
+包含），并确认图片仍在 attachment 存储中；附件被清理等底层原因会一并写在错误信息里。
 
 ## 开发
 
-```bash
-npm ci
-npm run check
-```
-
-主要模块：
-
-- `src/adapter.ts`：DSH LLM 消息与 Antigravity Gemini 请求/SSE 的转换。
-- `src/auth.ts`：凭据文件读写、权限设置和 access token 刷新。
-- `src/web-auth.ts`、`src/client.tsx`：Web UI OAuth 服务和设置页。
-- `src/login.ts`、`src/oauth-callback.ts`：CLI 登录和本机 callback server。
-- `src/host-audit.ts`：宿主包自检，共享实例被副本遮蔽时在启动日志里报警。
-
-### 跟进宿主新版本
-
-插件只对着当前宿主开发，所以升级 dsh 之后要同步抬基线，而不是加兼容分支：
-
-```bash
-npm install --save-dev \
-  @deepseek-ai/dsh-llm@<new> @deepseek-ai/dsh-typert-protocol@<new> @deepseek-ai/dsh-settings@<new> \
-  @deepseek-ai/cordis@<new> @deepseek-ai/schemastery@<new> \
-  @deepseek-ai/dsh-client-connection@<new> @deepseek-ai/dsh-client-ui-settings@<new> \
-  @deepseek-ai/dsh-client-ui-primitives@<new> @deepseek-ai/dsh-client-ui-renderer@<new>
-npm run check
-```
-
-`peerDependencies` 与 `peerDependenciesMeta` 里的版本一起改（范围只是基线声明）。然后按上面的
-「安装」步骤装进 profile 起一次宿主：登录分区能渲染、`/api/antigravityAuth/status` 返回 200（而不是
-404）、`prepareCall` 是函数，就说明这一版宿主仍然兼容。`tsc` 只对着 `devDependencies` 解析，`--listFiles`
-可以确认它读的是哪一份类型。
-
-## 发布本地构建包
-
-更新 `package.json` 版本后执行：
-
-```bash
-npm run check
-npm run pack
-```
-
-tarball 会写入 `artifacts/`；该目录中的 `*.tgz` 已被 `.gitignore` 忽略。发布到 GitHub 时，建议
-将 tarball 作为 GitHub Release 附件，而不是提交到源码仓库：
-
-```bash
-git tag -a v0.3.2 -m "v0.3.2" && git push origin v0.3.2
-gh release create v0.3.2 artifacts/dsh-antigravity-oauth-0.3.2.tgz \
-  --title v0.3.2 --notes-file /tmp/release-notes-v0.3.2.md
-```
-
-Release 正文用中英双语：中文段按新功能、修复、文档、兼容性、安装、校验分节，英文段与之一一对应，
-末尾附 `npm run check` 结果、产物文件名、文件数和 SHA-256。发布后核对附件 digest 与本地一致：
-
-```bash
-gh api repos/Eridani075/deepseek-harness-antigravity-oauth/releases/tags/v0.3.2 \
-  --jq '.assets[] | .name + " " + .digest'
-shasum -a 256 artifacts/dsh-antigravity-oauth-0.3.2.tgz
-```
+开发、宿主契约、升级基线步骤和发布流程见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
 ## License
 
