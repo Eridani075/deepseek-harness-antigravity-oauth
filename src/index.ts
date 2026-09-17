@@ -14,9 +14,8 @@ export const name = 'llm-antigravity-oauth'
 export const inject = ['llm']
 
 /**
- * Lowercase-hyphenated literal rather than the `settingsNamespace()` helper,
- * which dsh 0.1.5 no longer exports. The brand is type-level only: 0.1.0-rc.6
- * brands the return value, 0.1.5 constrains the literal at the call site.
+ * Lowercase-hyphenated literal, which is what dsh 0.1.5 constrains at the call
+ * site: `settingsNamespace()` is gone and the brand is type-level only.
  */
 const SETTINGS_NS = 'llm-antigravity-oauth' as SettingsNamespace
 const PROVIDER_SETTINGS_PATH = ['providers', PROVIDER] as const

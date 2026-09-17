@@ -67,13 +67,13 @@ describe('findShadowedHostPackages', () => {
   it('reports a copy the plugin resolves before the host installation', async () => {
     const { home, pluginAnchor, profileModules } = await harnessHome()
     await install(join(home, 'profiles'), PKG, { version: HOST_VERSION })
-    await install(join(home, 'profiles', 'web'), PKG, { version: '0.1.0-rc.8' })
+    await install(join(home, 'profiles', 'web'), PKG, { version: '0.1.5-rc.1' })
 
     const shadowed = findShadowedHostPackages({ specifiers: [PKG], loadedAnchor: pluginAnchor })
 
     expect(shadowed).toHaveLength(1)
     expect(shadowed[0]?.specifier).toBe(PKG)
-    expect(shadowed[0]?.loaded).toMatchObject({ version: '0.1.0-rc.8', proxy: false })
+    expect(shadowed[0]?.loaded).toMatchObject({ version: '0.1.5-rc.1', proxy: false })
     expect(shadowed[0]?.loaded.path).toBe(await realpath(join(profileModules, ...PKG.split('/'))))
     expect(shadowed[0]?.host.version).toBe(HOST_VERSION)
   })
@@ -82,13 +82,13 @@ describe('findShadowedHostPackages', () => {
     const { home, pluginAnchor } = await harnessHome()
     await install(join(home, 'profiles'), PKG, { version: HOST_VERSION })
     await install(join(home, 'profiles', 'web'), PKG, {
-      version: '0.1.0-rc.8',
+      version: '0.1.5-rc.1',
       exports: { '.': './index.js' },
     })
 
     const shadowed = findShadowedHostPackages({ specifiers: [PKG], loadedAnchor: pluginAnchor })
 
-    expect(shadowed[0]?.loaded.version).toBe('0.1.0-rc.8')
+    expect(shadowed[0]?.loaded.version).toBe('0.1.5-rc.1')
   })
 
   it('reports a same-version second copy, which is a different module instance', async () => {
@@ -121,7 +121,7 @@ describe('findShadowedHostPackages', () => {
     // pnpm layout: the package is linked into node_modules while its dependencies
     // sit beside the store copy, so only the real path resolves them.
     const store = join(root, 'store', 'dsh-antigravity-oauth@0.3.4')
-    await install(store, PKG, { version: '0.1.0-rc.8' })
+    await install(store, PKG, { version: '0.1.5-rc.1' })
     const packageDir = join(store, 'node_modules', 'dsh-antigravity-oauth')
     await mkdir(join(packageDir, 'lib'), { recursive: true })
     await writeFile(join(packageDir, 'lib', 'index.mjs'), '')
@@ -133,12 +133,12 @@ describe('findShadowedHostPackages', () => {
     const shadowed = findShadowedHostPackages({ specifiers: [PKG], loadedAnchor: join(link, 'lib', 'index.mjs') })
 
     expect(shadowed).toHaveLength(1)
-    expect(shadowed[0]?.loaded.version).toBe('0.1.0-rc.8')
+    expect(shadowed[0]?.loaded.version).toBe('0.1.5-rc.1')
   })
 
   it('stays silent when either side cannot resolve the package', async () => {
     const { home, pluginAnchor } = await harnessHome()
-    await install(join(home, 'profiles', 'web'), PKG, { version: '0.1.0-rc.8' })
+    await install(join(home, 'profiles', 'web'), PKG, { version: '0.1.5-rc.1' })
 
     expect(findShadowedHostPackages({ specifiers: [PKG], loadedAnchor: pluginAnchor })).toEqual([])
     expect(findShadowedHostPackages({ specifiers: [PKG], loadedAnchor: join(home, 'missing', 'anchor.js') })).toEqual([])
@@ -149,14 +149,14 @@ describe('reportShadowedHostPackages', () => {
   it('warns with both copies and the way out', async () => {
     const { home, pluginAnchor } = await harnessHome()
     await install(join(home, 'profiles'), PKG, { version: HOST_VERSION })
-    await install(join(home, 'profiles', 'web'), PKG, { version: '0.1.0-rc.8' })
+    await install(join(home, 'profiles', 'web'), PKG, { version: '0.1.5-rc.1' })
     const warn = vi.fn()
 
     reportShadowedHostPackages({ warn }, { specifiers: [PKG], loadedAnchor: pluginAnchor })
 
     expect(warn).toHaveBeenCalledTimes(2)
     const detail = String(warn.mock.calls[0]?.[0])
-    expect(detail).toContain('0.1.0-rc.8')
+    expect(detail).toContain('0.1.5-rc.1')
     expect(detail).toContain('profiles/web/node_modules/@deepseek-ai/dsh-llm')
     expect(detail).toContain(HOST_VERSION)
     const advice = String(warn.mock.calls[1]?.[0])

@@ -67,31 +67,33 @@ antigravity-<上游新增模型>      例如 antigravity-gemini-3.8-flash
 ## 兼容性
 
 - Node.js 20 或更高版本
-- `@deepseek-ai/dsh@0.1.0-rc.6` 开发/验证基线
-- 安装验证：`dsh` CLI `0.1.5-rc.1`（`@deepseek-ai/dsh-*` `0.1.5-rc.2`）
+- 开发/验证基线：`dsh` CLI `0.1.5-rc.1`，`@deepseek-ai/dsh-*@0.1.5-rc.2`
 - OAuth 和 transport 由 [cortexkit/antigravity-auth](https://github.com/cortexkit/antigravity-auth)
   提供
 
+**只支持当前 dsh 发行版**。dsh 还在测试阶段，每个 rc 都可能破坏插件，本项目不再为旧宿主保留兼容分支：
+0.4.0 起最低要求 `0.1.5-rc` 线的宿主（开发与验证都对着 `0.1.5-rc.2`）。宿主升级时跟着升级插件；还停在
+`0.1.0-rc.x` 宿主的请先升级 dsh 本身。
+
 宿主提供的包（`@deepseek-ai/*`）在 `package.json` 里全部是 **optional** peer dependency，插件运行时
-只 import 宿主进程里那一份，不会随插件安装自己的副本。Peer 里的版本范围（`^0.1.0-rc.6`）只表示开发
+只 import 宿主进程里那一份，不会随插件安装自己的副本。Peer 里的版本范围（`^0.1.5-rc.2`）只表示开发
 基线，不代表兼容上限：按 semver 规则，预发布版本只在同一个 `major.minor.patch` 三元组内互相匹配，
-`^0.1.0-rc.6` 匹配不到 `0.1.5-rc.x`，所以把范围写准这件事在 rc 阶段并不存在。0.3.3 及更早版本把
-这些 peer 声明成必需项，`autoInstallPeers=true` 的包管理器会装进一整套旧副本（见「故障排查」的
-「登录按钮报 HTTP 404」）。
+把范围写准这件事在 rc 阶段并不存在。0.3.3 及更早版本把这些 peer 声明成必需项，`autoInstallPeers=true`
+的包管理器会装进一整套旧副本（见「故障排查」的「登录按钮报 HTTP 404」）。
 
-dsh 在测试阶段会有破坏性更新。插件已适配以下变更，并同时兼容新旧宿主：
+插件依赖的宿主契约（宿主 API 变化时按这份清单核对）：
 
-| 变更 | 旧宿主 | 新宿主 | 插件做法 |
-| --- | --- | --- | --- |
-| tool call id 类型 | `CallId` | `ToolCallId` | 从 `ToolCallBlock['id']` 推导，不导入品牌函数 |
-| settings 命名空间 | `settingsNamespace()` | 仅接受字面量 | 使用 `'llm-antigravity-oauth'` 字面量 |
-| 前端 Context 类型 | `dsh-client-runtime/client` | `@deepseek-ai/cordis` | 从 cordis 导入 `Context` 类型 |
-| Remote 标记存储 | `dsh-typert-protocol` 写进模块私有 `WeakMap` | 写成原型属性 `@deepseek-ai/dsh-typert-protocol/remote-methods` | 不自行实现标记读取，只 import 宿主那一份；副本会导致 `/api/*` 全线 404 |
-| LLM 适配器调度 | `LlmRuntime` 直接调用 `adapter.stream()` | 经 `LlmAdapter.prepareCall()` 包装 `stream()` | 只实现 `stream()`，由宿主基类提供两步式入口 |
+| 依赖 | 插件做法 |
+| --- | --- |
+| `dsh-typert-protocol` 用原型上的标记读取 `@Remote` 方法 | 不自行实现标记读写，只 import 宿主那一份；出现副本会导致 `/api/*` 全线 404 |
+| LLM 派发经 `LlmAdapter.prepareCall()` 两步式入口 | 只实现 `stream()`，不覆盖 `prepareCall` |
+| tool call id 是 `@deepseek-ai/dsh-llm/brand` 的品牌类型 | 用 `ToolCallId()` 构造，不导入也不自造别名 |
+| settings 命名空间只接受字面量（`settingsNamespace()` 已移除） | 使用 `'llm-antigravity-oauth'` 字面量 |
+| 前端 `Context` 来自 `@deepseek-ai/cordis`，slot 注册走 `ctx.slots`（由 `dsh-client-ui-renderer` 声明），设置分区契约由 `dsh-client-ui-settings` 声明 | 只做 type-only import，slot 与设置分区按契约注册 |
+| `replayState` 是宿主的 `ReplayEnvelope`：`response` 放适配器私有元数据，`blocks` 与消息块一一对应 | 版本头放在 `response` 里；`blocks` 与发出的块数一致，宿主截断时会同步裁剪 |
 
-后两条不是源码层面的适配，而是**模块实例必须唯一**：宿主用自己的 `remoteMethods()` 读标记、用自己的
-`LlmAdapter` 基类派发请求，插件一旦 import 到第二份副本就会注册宿主认不出的类。0.3.4 起插件在加载时
-自检这两个包，解析到非宿主副本时会在启动日志里直接点名（而不是只留一个 404）。
+插件在加载时自检 `dsh-llm` 与 `dsh-typert-protocol`：解析到非宿主副本时会在启动日志里直接点名版本和
+路径（而不是只留一个 404）。自检对「无法判断」的情况保持静默。
 
 ## 安装
 
@@ -250,8 +252,9 @@ ls "${DSH_HOME:-$HOME/.dsh}"/profiles/web/node_modules/.pnpm/node_modules/@deeps
 
 ### 启动时报 `does not provide an export named ...`
 
-dsh 测试阶段会重命名或移除导出，例如 `CallId` → `ToolCallId`、移除 `settingsNamespace`。先升级插件
-到最新版本；仍报错时，在 issue 中附上 `dsh --version` 和完整报错。不要附带任何 OAuth 凭据。
+dsh 在 rc 之间会重命名或移除导出（例如 `CallId` → `ToolCallId`，以及移除 `settingsNamespace()`）。插件
+只对当前宿主版本开发，所以这类报错的处理方式是**升级插件**（如果是升级 dsh 之后出现的）；仍报错时，
+在 issue 中附上 `dsh --version` 和完整报错。不要附带任何 OAuth 凭据。
 
 ### `Antigravity token exchange failed: fetch failed`
 
@@ -311,6 +314,25 @@ npm run check
 - `src/auth.ts`：凭据文件读写、权限设置和 access token 刷新。
 - `src/web-auth.ts`、`src/client.tsx`：Web UI OAuth 服务和设置页。
 - `src/login.ts`、`src/oauth-callback.ts`：CLI 登录和本机 callback server。
+- `src/host-audit.ts`：宿主包自检，共享实例被副本遮蔽时在启动日志里报警。
+
+### 跟进宿主新版本
+
+插件只对着当前宿主开发，所以升级 dsh 之后要同步抬基线，而不是加兼容分支：
+
+```bash
+npm install --save-dev \
+  @deepseek-ai/dsh-llm@<new> @deepseek-ai/dsh-typert-protocol@<new> @deepseek-ai/dsh-settings@<new> \
+  @deepseek-ai/cordis@<new> @deepseek-ai/schemastery@<new> \
+  @deepseek-ai/dsh-client-connection@<new> @deepseek-ai/dsh-client-ui-settings@<new> \
+  @deepseek-ai/dsh-client-ui-primitives@<new> @deepseek-ai/dsh-client-ui-renderer@<new>
+npm run check
+```
+
+`peerDependencies` 与 `peerDependenciesMeta` 里的版本一起改（范围只是基线声明）。然后按上面的
+「安装」步骤装进 profile 起一次宿主：登录分区能渲染、`/api/antigravityAuth/status` 返回 200（而不是
+404）、`prepareCall` 是函数，就说明这一版宿主仍然兼容。`tsc` 只对着 `devDependencies` 解析，`--listFiles`
+可以确认它读的是哪一份类型。
 
 ## 发布本地构建包
 

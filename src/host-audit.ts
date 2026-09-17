@@ -15,11 +15,12 @@ export function dshHomeDirectory(): string {
  * Host packages whose module instance must be the host installation's own.
  *
  * A private copy is not a version problem but an identity problem: the gateway
- * reads Remote markers with its own `remoteMethods()` and the LLM runtime
- * dispatches through its own `LlmAdapter` base class, so a plugin built against
- * a second copy registers classes the host cannot recognize. The symptoms are
- * endpoints answering 404 and `prepareCall is not a function`, neither of which
- * points at the dependency tree, so the mismatch is reported at load time.
+ * reads Remote markers (a prototype property set by `@Remote`) with its own
+ * `remoteMethods()`, and the LLM runtime dispatches through its own
+ * `LlmAdapter` base class, so a plugin built against a second copy registers
+ * classes the host cannot recognize. The symptoms are endpoints answering 404
+ * and `prepareCall is not a function`, neither of which points at the
+ * dependency tree, so the mismatch is reported at load time.
  *
  * `@deepseek-ai/schemastery` is deliberately absent: it is also duplicated by an
  * auto-installing package manager but has no identity-sensitive use here.

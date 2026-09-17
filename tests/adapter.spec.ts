@@ -5,6 +5,7 @@ import {
 } from '@cortexkit/antigravity-auth-core'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, {
+  BlockAssembler,
   LlmError,
   ReasoningEffortId,
   attributionHeaders,
@@ -14,8 +15,8 @@ import LlmRuntime, {
   type ContentBlock,
   type GenerateOptions,
   type StreamChunk,
-  type ToolCallBlock,
 } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as Plugin from '../src/index.js'
 import {
@@ -135,6 +136,7 @@ describe('AntigravityAdapter', () => {
       type: 'finish',
       reason: { kind: 'tool-calls' },
       replayState: {
+        response: { kind: 'dsh-antigravity-oauth', version: 2, provider: 'antigravity', model: MODEL },
         blocks: [
           { type: 'reasoning', thoughtSignature: 'sig-r' },
           { type: 'tool-call', thoughtSignature: 'sig-tool' },
@@ -169,7 +171,7 @@ describe('AntigravityAdapter', () => {
   })
 
   it('replays thought signatures and tool results losslessly', async () => {
-    const callId = 'call_history' as ToolCallBlock['id']
+    const callId = ToolCallId('call_history')
     const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
       candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }],
     })))
@@ -183,10 +185,7 @@ describe('AntigravityAdapter', () => {
           provider: 'antigravity',
           model: MODEL,
           replayState: {
-            kind: 'dsh-antigravity-oauth',
-            version: 1,
-            provider: 'antigravity',
-            model: MODEL,
+            response: { kind: 'dsh-antigravity-oauth', version: 2, provider: 'antigravity', model: MODEL },
             blocks: [
               { type: 'reasoning', thoughtSignature: 'sig-r' },
               { type: 'tool-call', thoughtSignature: 'sig-t' },
@@ -221,6 +220,118 @@ describe('AntigravityAdapter', () => {
         }],
       },
     ])
+  })
+
+  it('replays entries the host pruned with a truncated response', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
+      candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }],
+    })))
+    // What the host persists for a max-token response: a dropped block and its
+    // metadata entry go together, so the lengths still agree.
+    const messages = [
+      createAssistantMessage({
+        content: [{ type: 'reasoning', text: 'why' }, { type: 'text', text: 'partial' }],
+        source: {
+          provider: 'antigravity',
+          model: MODEL,
+          replayState: {
+            response: { kind: 'dsh-antigravity-oauth', version: 2, provider: 'antigravity', model: MODEL },
+            blocks: [
+              { type: 'reasoning', thoughtSignature: 'sig-r' },
+              { type: 'text', thoughtSignature: 'sig-text' },
+            ],
+          },
+        },
+      }),
+    ]
+
+    await collect(adapter(transport).stream(options({ messages })))
+    const envelope = JSON.parse(String(transport.mock.calls[0]?.[1]?.body))
+    expect(envelope.request.contents[0].parts).toEqual([
+      { text: 'why', thought: true, thoughtSignature: 'sig-r' },
+      { text: 'partial', thoughtSignature: 'sig-text' },
+    ])
+  })
+
+  it('still replays an envelope written before 0.4.0', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events({
+      candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }],
+    })))
+    const messages = [
+      createAssistantMessage({
+        content: [{ type: 'text', text: 'earlier' }],
+        source: {
+          provider: 'antigravity',
+          model: MODEL,
+          // The flat header shape sessions carry from the versions before this one.
+          replayState: {
+            kind: 'dsh-antigravity-oauth',
+            version: 1,
+            provider: 'antigravity',
+            model: MODEL,
+            blocks: [{ type: 'text', thoughtSignature: 'sig-legacy' }],
+          } as never,
+        },
+      }),
+    ]
+
+    await collect(adapter(transport).stream(options({ messages })))
+    const envelope = JSON.parse(String(transport.mock.calls[0]?.[1]?.body))
+    expect(envelope.request.contents[0].parts).toEqual([
+      { text: 'earlier', thoughtSignature: 'sig-legacy' },
+    ])
+  })
+
+  it('rejects replay metadata that does not line up with its message', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events()))
+    const messages = [
+      createAssistantMessage({
+        content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }],
+        source: {
+          provider: 'antigravity',
+          model: MODEL,
+          replayState: {
+            response: { kind: 'dsh-antigravity-oauth', version: 2, provider: 'antigravity', model: MODEL },
+            blocks: [{ type: 'text', thoughtSignature: 'sig-a' }],
+          },
+        },
+      }),
+    ]
+
+    await expect(collect(adapter(transport).stream(options({ messages })))).rejects.toMatchObject({
+      code: 'INVALID_HISTORY',
+      message: expect.stringContaining('does not match its assistant message') as unknown as string,
+    })
+    expect(transport).not.toHaveBeenCalled()
+  })
+
+  it('keeps its replay metadata through the host block assembler', async () => {
+    const transport = vi.fn<typeof fetchWithAgyCliTransport>(() => Promise.resolve(events(
+      { candidates: [{ content: { parts: [{ thought: true, text: 'plan', thoughtSignature: 'sig-r' }] } }] },
+      {
+        candidates: [{
+          content: { parts: [{ text: 'answer', thoughtSignature: 'sig-t' }] },
+          finishReason: 'STOP',
+        }],
+      },
+    )))
+    const chunks = await collect(adapter(transport).stream(options()))
+
+    // The host owns the envelope: its assembler drops metadata entries in step
+    // with dropped blocks, and discards an envelope whose entries do not align
+    // with the emitted blocks. Feeding the real chunks through it is the check
+    // that this adapter's metadata survives assembly.
+    const assembler = new BlockAssembler()
+    for (const chunk of chunks) assembler.push(chunk)
+
+    expect(assembler.blocks().map(block => block.type)).toEqual(['reasoning', 'text'])
+    expect(assembler.replayState).toEqual({
+      response: { kind: 'dsh-antigravity-oauth', version: 2, provider: 'antigravity', model: MODEL },
+      blocks: [
+        { type: 'reasoning', thoughtSignature: 'sig-r' },
+        { type: 'text', thoughtSignature: 'sig-t' },
+      ],
+    })
   })
 
   it('falls back only after 404 and refreshes once after 401', async () => {

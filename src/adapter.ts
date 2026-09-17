@@ -28,10 +28,12 @@ import {
   type LlmModelInfo,
   type LlmResolvedModelInfo,
   type Message,
+  type ReplayEnvelope,
   type StreamChunk,
   type TokenUsage,
   type ToolCallBlock,
 } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import { randomUUID } from 'node:crypto'
 import {
   credentialsForRequest,
@@ -43,6 +45,10 @@ export const PROVIDER = 'antigravity'
 
 const STREAM_ACTION = 'streamGenerateContent'
 const IDLE_TIMEOUT_MS = 5 * 60_000
+/** Marker inside the host replay envelope that identifies this adapter's metadata. */
+const REPLAY_KIND = 'dsh-antigravity-oauth'
+/** Envelope header version written by this build; 1 is the pre-0.4.0 flat shape. */
+const REPLAY_VERSION = 2
 // Antigravity occasionally answers with a bare `finishReason: STOP` and no
 // parts. The request is cheap to repeat and nothing has been emitted yet, so
 // the whole attempt is retried before the empty-response error surfaces.
@@ -101,11 +107,22 @@ interface ReplayBlock {
   thoughtSignature?: string
 }
 
-interface ReplayState {
-  kind: 'dsh-antigravity-oauth'
-  version: 1
+/**
+ * Adapter-private header carried in the host replay envelope's `response` field.
+ * The envelope itself is host-owned: its optional `blocks` field must hold one
+ * entry per emitted block, because the host prunes entries in step with the
+ * blocks it drops (max-token truncation) and discards an envelope that does not
+ * line up.
+ */
+interface ReplayHeader {
+  kind: typeof REPLAY_KIND
+  version: number
   provider: string
   model: string
+}
+
+/** Replay metadata of one assistant message, after validation. */
+interface ReplayState {
   blocks: ReplayBlock[]
 }
 
@@ -147,13 +164,6 @@ interface StoredImage {
 }
 
 type ImageReader = (ref: ImageAttachmentRef) => Promise<GeminiPart>
-
-/**
- * Provider-issued tool-call id. Derived from the host block type instead of
- * importing the brand helper, whose name differs across host versions
- * (`CallId` in 0.1.0-rc.6, `ToolCallId` in 0.1.5-rc.x).
- */
-type ToolCallId = ToolCallBlock['id']
 
 const modelDefinitions = getPublicModelDefinitions()
 const geminiModels = Object.values(modelDefinitions)
@@ -277,6 +287,20 @@ function parseArguments(raw: string, callId: string): Record<string, unknown> {
   throw new LlmError(`Tool call ${callId} has invalid JSON object arguments`, 'INVALID_HISTORY')
 }
 
+/**
+ * Header of one replay envelope. The current shape nests it under the host
+ * envelope's `response` field; envelopes written before 0.4.0 kept it flat, and
+ * a message carrying one is still replayed with its signatures.
+ */
+function replayHeader(state: Record<string, unknown>): Record<string, unknown> | undefined {
+  const nested = state.response
+  if (nested !== null && typeof nested === 'object' && !Array.isArray(nested)) {
+    const header = nested as Record<string, unknown>
+    if (header.kind === REPLAY_KIND) return header
+  }
+  return state.kind === REPLAY_KIND ? state : undefined
+}
+
 function replayOf(message: Message, options: GenerateOptions): ReplayState | undefined {
   if (message.role !== 'assistant' || message.source.kind !== 'model') return undefined
   if (message.source.provider !== options.provider || message.source.model !== options.model) return undefined
@@ -285,13 +309,15 @@ function replayOf(message: Message, options: GenerateOptions): ReplayState | und
   if (state === null || typeof state !== 'object') {
     throw new LlmError('Antigravity replay state is not an object', 'INVALID_HISTORY')
   }
-  const value = state as Partial<ReplayState>
-  if (value.kind !== 'dsh-antigravity-oauth' || value.version !== 1
-    || value.provider !== message.source.provider || value.model !== message.source.model
+  const value = state as Record<string, unknown>
+  const header = replayHeader(value)
+  if (header === undefined
+    || (header.version !== 1 && header.version !== REPLAY_VERSION)
+    || header.provider !== message.source.provider || header.model !== message.source.model
     || !Array.isArray(value.blocks) || value.blocks.length !== message.content.length) {
     throw new LlmError('Antigravity replay state does not match its assistant message', 'INVALID_HISTORY')
   }
-  for (const [index, block] of value.blocks.entries()) {
+  for (const [index, block] of (value.blocks as (ReplayBlock | null)[]).entries()) {
     if (block === null || typeof block !== 'object'
       || !['text', 'reasoning', 'tool-call'].includes(block.type)
       || block.type !== message.content[index]?.type
@@ -299,7 +325,7 @@ function replayOf(message: Message, options: GenerateOptions): ReplayState | und
       throw new LlmError('Antigravity replay state contains an invalid block', 'INVALID_HISTORY')
     }
   }
-  return value as ReplayState
+  return { blocks: value.blocks as ReplayBlock[] }
 }
 
 function assistantParts(message: Message, options: GenerateOptions): GeminiPart[] {
@@ -892,7 +918,7 @@ export class AntigravityAdapter extends LlmAdapter {
             if (part.functionCall) {
               for (const event of closeText()) yield event
               for (const event of closeReasoning()) yield event
-              const id = (part.functionCall.id ?? `call_${randomUUID()}`) as ToolCallId
+              const id = ToolCallId(part.functionCall.id ?? `call_${randomUUID()}`)
               const name = part.functionCall.name ?? ''
               const argumentsText = JSON.stringify(part.functionCall.args ?? {})
               const index = nextIndex++
@@ -965,11 +991,13 @@ export class AntigravityAdapter extends LlmAdapter {
             ? { kind: 'max-tokens' as const }
             : { kind: 'stop' as const }
         if (reason.kind !== 'tool-calls') this.requestSessions.completeExecution(String(options.sessionId ?? '__default__'))
-        const replayState: ReplayState = {
-          kind: 'dsh-antigravity-oauth',
-          version: 1,
-          provider: options.provider,
-          model: options.model,
+        const replayState: ReplayEnvelope = {
+          response: {
+            kind: REPLAY_KIND,
+            version: REPLAY_VERSION,
+            provider: options.provider,
+            model: options.model,
+          } satisfies ReplayHeader,
           blocks: replayBlocks,
         }
         yield { type: 'finish', reason, replayState }

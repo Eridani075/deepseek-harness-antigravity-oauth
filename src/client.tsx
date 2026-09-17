@@ -1,6 +1,9 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
+// The slot registry service (`ctx.slots`) is declared by the renderer, the slot
+// contracts by the settings shell; both are type-only imports of browser module ids.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import {
   Button,
