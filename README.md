@@ -72,6 +72,13 @@ antigravity-<上游新增模型>      例如 antigravity-gemini-3.8-flash
 - OAuth 和 transport 由 [cortexkit/antigravity-auth](https://github.com/cortexkit/antigravity-auth)
   提供
 
+宿主提供的包（`@deepseek-ai/*`）在 `package.json` 里全部是 **optional** peer dependency，插件运行时
+只 import 宿主进程里那一份，不会随插件安装自己的副本。Peer 里的版本范围（`^0.1.0-rc.6`）只表示开发
+基线，不代表兼容上限：按 semver 规则，预发布版本只在同一个 `major.minor.patch` 三元组内互相匹配，
+`^0.1.0-rc.6` 匹配不到 `0.1.5-rc.x`，所以把范围写准这件事在 rc 阶段并不存在。0.3.3 及更早版本把
+这些 peer 声明成必需项，`autoInstallPeers=true` 的包管理器会装进一整套旧副本（见「故障排查」的
+「登录按钮报 HTTP 404」）。
+
 dsh 在测试阶段会有破坏性更新。插件已适配以下变更，并同时兼容新旧宿主：
 
 | 变更 | 旧宿主 | 新宿主 | 插件做法 |
@@ -79,6 +86,12 @@ dsh 在测试阶段会有破坏性更新。插件已适配以下变更，并同�
 | tool call id 类型 | `CallId` | `ToolCallId` | 从 `ToolCallBlock['id']` 推导，不导入品牌函数 |
 | settings 命名空间 | `settingsNamespace()` | 仅接受字面量 | 使用 `'llm-antigravity-oauth'` 字面量 |
 | 前端 Context 类型 | `dsh-client-runtime/client` | `@deepseek-ai/cordis` | 从 cordis 导入 `Context` 类型 |
+| Remote 标记存储 | `dsh-typert-protocol` 写进模块私有 `WeakMap` | 写成原型属性 `@deepseek-ai/dsh-typert-protocol/remote-methods` | 不自行实现标记读取，只 import 宿主那一份；副本会导致 `/api/*` 全线 404 |
+| LLM 适配器调度 | `LlmRuntime` 直接调用 `adapter.stream()` | 经 `LlmAdapter.prepareCall()` 包装 `stream()` | 只实现 `stream()`，由宿主基类提供两步式入口 |
+
+后两条不是源码层面的适配，而是**模块实例必须唯一**：宿主用自己的 `remoteMethods()` 读标记、用自己的
+`LlmAdapter` 基类派发请求，插件一旦 import 到第二份副本就会注册宿主认不出的类。0.3.4 起插件在加载时
+自检这两个包，解析到非宿主副本时会在启动日志里直接点名（而不是只留一个 404）。
 
 ## 安装
 
@@ -91,6 +104,9 @@ dsh 在测试阶段会有破坏性更新。插件已适配以下变更，并同�
 dsh plugin --profile web add "/absolute/path/to/dsh-antigravity-oauth-VERSION.tgz"
 dsh --profile web --dump-config
 ```
+
+用 pnpm 9 时需要给 `add` 显式加 `-w`，否则 pnpm 会把 profile 当成 workspace root 并拒绝安装
+（`ERR_PNPM_ADDING_TO_ROOT`）：`dsh plugin --profile web add -w "<tgz>"`。
 
 ### 从源码构建
 
@@ -113,9 +129,15 @@ dsh --profile web --dump-config
 `llm-antigravity-oauth` 条目。安装或升级插件后，重启已经运行的 DSH Web 服务再刷新浏览器；
 不要在已有服务占用 `127.0.0.1:3080` 时重复启动第二个 `dsh web`。
 
-安装时 `pnpm` 可能提示缺少 DSH peer dependencies，以及 `hono`、`arctic`。DSH peer 由宿主提供，
-`hono` 和 `arctic` 不在本插件使用的 OAuth/transport 路径中；只要 bundle 能正常加载，就不需要
-为了消除提示而重复安装这些依赖到 profile。
+安装时 `pnpm` 可能提示缺少 `hono`、`arctic`（来自 `@cortexkit/antigravity-auth-core` 的传递依赖），
+它们不在本插件使用的 OAuth/transport 路径中；只要 bundle 能正常加载，就不需要为了消除提示而把这些依赖
+重复安装到 profile。DSH 的 peer dependency 从 0.3.4 起全部是 optional，pnpm 和 npm 都不会自动安装，
+因此也不会再出现「缺少 DSH peer dependencies」的提示。
+
+profile 的 `pnpm-workspace.yaml` 里 dsh 写了 `autoInstallPeers: false` 和 `nodeLinker: hoisted`，但
+**pnpm 9 只从这个文件读 `packages:`**，设置项要 pnpm 10 才生效（pnpm 9 读 `.npmrc`）。装 0.3.4 不受
+影响（peer 已是 optional）；0.3.3 及更早版本在 pnpm 9 下会因此多装 100 多个包，也就是下面「登录按钮报
+HTTP 404」的成因。
 
 ## 登录
 
@@ -170,6 +192,46 @@ dsh --profile web --dump-config
 
 确认输出包含 `dsh-antigravity-oauth` 和 `llm-antigravity-oauth` 后，重启 DSH Web 服务并重新打开
 Settings → Models。
+
+### 登录按钮报 HTTP 404
+
+点「登录 Google」报 `transport failure for /api/antigravityAuth/start: HTTP 404`，跑模型报
+`registration.adapter.prepareCall is not a function`——这两个报错是同一个原因：插件的
+`node_modules` 里存在第二份 `@deepseek-ai/dsh-*`，插件 import 的是旧副本，宿主认不出它注册的类。
+
+- `dsh-typert-protocol` 存 Remote 标记的位置在两代之间变了（模块私有 `WeakMap` → 原型属性），插件用旧
+  副本打标记、宿主用自己那份读，方法列表为空，所以 `/api/antigravityAuth/*` 全部 404。Service 本身是
+  可见的，插件也能正常加载，只有端点没被认领。
+- `LlmAdapter` 的两步式入口 `prepareCall()` 只存在于新宿主的基类上，旧副本的基类没有这个方法，于是
+  `registration.adapter.prepareCall is not a function`。
+
+0.3.3 及更早版本在 `autoInstallPeers=true` 的包管理器下必然触发（pnpm 9 读不到 dsh 写在
+`pnpm-workspace.yaml` 里的 `autoInstallPeers: false`，见上一节）。0.3.4 起 peer 全部 optional，不再
+安装副本；加载时还会自检这两个包，解析到非宿主副本时直接写进启动日志：
+
+```text
+antigravity: private copies of the DSH host packages shadow the host installation — @deepseek-ai/dsh-llm 0.1.0-rc.8 at …, not the host's 0.1.5-rc.2 at …
+```
+
+修复办法（按推荐顺序）：
+
+1. 升级到 0.3.4 或更高版本重装，多余的副本会在重装时被清掉。
+2. 留在旧版本：在 profile 目录放一个 pnpm 9 也读的 `.npmrc`，然后重装。
+   ```bash
+   printf 'auto-install-peers=false\n' >> "${DSH_HOME:-$HOME/.dsh}/profiles/web/.npmrc"
+   ```
+   同一个版本号重装时 pnpm 会报 “Already up to date” 而不重新解析，需要先删掉
+   `profiles/web/node_modules/dsh-antigravity-oauth` 以及 `pnpm-lock.yaml` 里对应的条目。
+3. pnpm 10 及以上不受影响：`pnpm-workspace.yaml` 里的设置生效，本来就不会装 peer。
+
+判断当前是否踩中，看 profile 里有没有第二份副本：
+
+```bash
+ls "${DSH_HOME:-$HOME/.dsh}"/profiles/web/node_modules/.pnpm/node_modules/@deepseek-ai 2>/dev/null
+```
+
+有输出（`dsh-llm`、`dsh-typert-protocol` 等）就是中招；`@deepseek-ai/*` 正确解到
+`${DSH_HOME:-$HOME/.dsh}/profiles/node_modules/@deepseek-ai` 那份时不会有这个目录。
 
 ### `EADDRINUSE: 127.0.0.1:3080`
 

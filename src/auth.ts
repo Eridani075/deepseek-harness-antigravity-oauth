@@ -6,8 +6,8 @@ import {
 } from '@cortexkit/antigravity-auth-core'
 import { INVALID_CREDENTIAL_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import { chmod, mkdir, readFile, unlink } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { dshHomeDirectory } from './host-audit.js'
 
 const CREDENTIAL_VERSION = 1
 const EXPIRY_BUFFER_MS = 60_000
@@ -26,8 +26,7 @@ const refreshes = new Map<string, Promise<StoredCredentials>>()
 export function credentialFilePath(): string {
   const explicit = process.env.DSH_ANTIGRAVITY_AUTH_FILE?.trim()
   if (explicit) return resolve(explicit)
-  const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
-  return join(dshHome, 'antigravity-oauth.json')
+  return join(dshHomeDirectory(), 'antigravity-oauth.json')
 }
 
 function parseCredentials(value: unknown, path: string): StoredCredentials {

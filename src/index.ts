@@ -2,10 +2,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { AntigravityAdapter, PROVIDER } from './adapter.js'
+import { reportShadowedHostPackages } from './host-audit.js'
 import { AntigravityAuthService } from './web-auth.js'
 
 export { AntigravityAdapter, PROVIDER, parseGeminiSse } from './adapter.js'
 export { credentialFilePath } from './auth.js'
+export { findShadowedHostPackages, SHARED_HOST_PACKAGES } from './host-audit.js'
 export { AntigravityAuthService } from './web-auth.js'
 
 export const name = 'llm-antigravity-oauth'
@@ -51,6 +53,11 @@ function providerProfiles(value: unknown): Record<string, unknown> {
 }
 
 export function apply(ctx: Context): void {
+  // This plugin registers classes the host must recognize by identity: a package
+  // manager that auto-installs the host peers leaves it importing private copies,
+  // which surfaces as 404 endpoints and a missing base-class method rather than
+  // as an install error.
+  reportShadowedHostPackages({ warn: message => ctx.logger.warn(message) })
   const authService = new AntigravityAuthService(ctx)
   const providerRegistration = ctx.llm.registerConfigurableProviders([PROVIDER_ENTRY])
   // Resolved per request: the attachment service may load after this plugin.
